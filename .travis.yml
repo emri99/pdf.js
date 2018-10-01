@@ -9,3 +9,13 @@ install:
   - npm install -g gulp-cli
   - npm install
   - npm update
+
+### e9 patch -- generate dist from master
+#before_deploy: git config --global user.email publish@travis.github && git config --global user.name "Travis"
+deploy:
+- provider: script
+  edge: true
+  skip_cleanup: true
+  script: gulp dist-pre
+  on:
+    branch: add-travis-deploy-stage
