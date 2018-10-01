@@ -65,7 +65,8 @@ var MOZCENTRAL_DIFF_FILE = 'mozcentral.diff';
 
 // e9-patch -- generate dist from master
 var REPO = 'git@github.com:emri99/pdf.js.git';
-var DIST_REPO_URL = 'https://github.com/emri99/pdfjs-dist';
+var DIST_REPO_URL = 'git@github.com:emri99/pdfjs-dist.git';
+// var DIST_REPO_URL = 'https://github.com/emri99/pdfjs-dist';
 
 var builder = require('./external/builder/builder.js');
 
@@ -1214,7 +1215,7 @@ gulp.task('dist-pre',
   var DIST_NAME = 'pdfjs-dist';
   var DIST_DESCRIPTION = 'Generic build of Mozilla\'s PDF.js library.';
   var DIST_KEYWORDS = ['Mozilla', 'pdf', 'pdf.js'];
-  var DIST_HOMEPAGE = 'http://mozilla.github.io/pdf.js/';
+  var DIST_HOMEPAGE = 'http://emri99.github.io/pdf.js/';
   var DIST_BUGS_URL = 'https://github.com/mozilla/pdf.js/issues';
   var DIST_LICENSE = 'Apache-2.0';
   var npmManifest = {
@@ -1310,6 +1311,17 @@ gulp.task('dist-install', ['dist-pre'], function () {
     distPath = path.relative(installPath, distPath);
   }
   safeSpawnSync('npm', ['install', distPath], opts);
+});
+
+gulp.task('t', function() {
+  console.log();
+  console.log('### Cloning baseline distribution', DIST_DIR);
+
+  rimraf.sync(DIST_DIR);
+  // mkdirp.sync(DIST_DIR);
+  safeSpawnSync('git', [
+    'clone', '-v', '--depth', '1', DIST_REPO_URL, DIST_DIR
+  ]);
 });
 
 gulp.task('dist-repo-git', ['dist-pre'], function () {

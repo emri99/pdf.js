@@ -16,6 +16,6 @@ deploy:
 - provider: script
   edge: true
   skip_cleanup: true
-  script: gulp dist-pre
+  script: gulp t
   on:
     branch: add-travis-deploy-stage
