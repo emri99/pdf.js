@@ -65,8 +65,8 @@ var MOZCENTRAL_DIFF_FILE = 'mozcentral.diff';
 
 // e9-patch -- generate dist from master
 var REPO = 'git@github.com:emri99/pdf.js.git';
-var DIST_REPO_URL = 'git@github.com:emri99/pdfjs-dist.git';
-// var DIST_REPO_URL = 'https://github.com/emri99/pdfjs-dist';
+// var DIST_REPO_URL = 'git@github.com:emri99/pdfjs-dist.git';
+var DIST_REPO_URL = 'https://github.com/emri99/pdfjs-dist';
 
 var builder = require('./external/builder/builder.js');
 
