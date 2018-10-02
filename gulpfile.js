@@ -118,6 +118,19 @@ function safeSpawnSync(command, parameters, options) {
   if (result.status !== 0) {
     console.log('Error: command "' + command + '" with parameters "' +
                 parameters + '" exited with code ' + result.status);
+
+      var stdout = result.stdout || '';
+      var stderr = result.stderr || '';
+
+      if (typeof stdout !== 'string') {
+        stdout = stdout.toString();
+      }
+
+      if (typeof stderr !== 'string') {
+        stderr = stderr.toString();
+      }
+
+      console.log('Command output: ', { stdout, stderr, });
     process.exit(result.status);
   }
   return result;
