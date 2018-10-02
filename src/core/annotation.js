@@ -612,7 +612,8 @@ class WidgetAnnotation extends Annotation {
 
     // Hide signatures because we cannot validate them.
     if (data.fieldType === 'Sig') {
-      this.setFlags(AnnotationFlag.HIDDEN);
+      // e9-patch, force display signatures
+      // this.setFlags(AnnotationFlag.HIDDEN);
     }
   }
 
@@ -767,6 +768,12 @@ class ButtonWidgetAnnotation extends WidgetAnnotation {
   _processCheckBox(params) {
     if (isName(this.data.fieldValue)) {
       this.data.fieldValue = this.data.fieldValue.name;
+    }
+
+    // e9-patch, add additional info for checkbox
+    const customAs = params.dict.get('AS');
+    if (isDict(customAs) && isName(customAs)) {
+      this.data.patchedInfo = customAs.name;
     }
 
     const customAppearance = params.dict.get('AP');

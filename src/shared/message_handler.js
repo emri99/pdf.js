@@ -109,7 +109,32 @@ function MessageHandler(sourceName, targetName, comObj) {
             targetName,
             isReply: true,
             callbackId: data.callbackId,
-            data: result,
+            // e9-patch, fix circular structure for signature fields
+            // shamely copied from PeculiarVentures patch
+            // data: result
+            data: (function() {
+              try {
+                if (
+                  Array.isArray(result) &&
+                  typeof result[0] === 'object' &&
+                  typeof result[0].id === 'string'
+                ) {
+                  result.map(function (obj) {
+                    if (
+                      typeof obj === 'object' &&
+                      obj.fieldType === 'Sig' &&
+                      typeof obj.fieldValue === 'object'
+                    ) {
+                      Object.assign(obj, { fieldValue: false, });
+                    }
+                  });
+                }
+                return result;
+              } catch (err) {
+                return result;
+              }
+            })(),
+            // patch end
           });
         }, (reason) => {
           comObj.postMessage({
