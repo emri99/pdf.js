@@ -176,12 +176,11 @@ function createWebpackConfig(defines, output) {
           // babel is too slow
           exclude: /src[\\\/]core[\\\/](glyphlist|unicode)/,
           options: {
-            presets: skipBabel ? undefined : ['env'],
+            presets: skipBabel ? undefined : ['@babel/preset-env'],
             plugins: [
-              'transform-es2015-modules-commonjs',
-              ['transform-runtime', {
+              '@babel/plugin-transform-modules-commonjs',
+              ['@babel/plugin-transform-runtime', {
                 'helpers': false,
-                'polyfill': false,
                 'regenerator': true,
               }],
             ],
@@ -717,18 +716,18 @@ gulp.task('minified-post', ['minified-pre'], function () {
   console.log();
   console.log('### Minifying js files');
 
-  var UglifyES = require('uglify-es');
+  var Terser = require('terser');
   // V8 chokes on very long sequences. Works around that.
   var optsForHugeFile = { compress: { sequences: false, }, };
 
   fs.writeFileSync(MINIFIED_DIR + '/web/pdf.viewer.js',
-                   UglifyES.minify(viewerFiles).code);
+                   Terser.minify(viewerFiles).code);
   fs.writeFileSync(MINIFIED_DIR + '/build/pdf.min.js',
-                   UglifyES.minify(pdfFile).code);
+                   Terser.minify(pdfFile).code);
   fs.writeFileSync(MINIFIED_DIR + '/build/pdf.worker.min.js',
-                   UglifyES.minify(pdfWorkerFile, optsForHugeFile).code);
+                   Terser.minify(pdfWorkerFile, optsForHugeFile).code);
   fs.writeFileSync(MINIFIED_DIR + 'image_decoders/pdf.image_decoders.min.js',
-                   UglifyES.minify(pdfImageDecodersFile).code);
+                   Terser.minify(pdfImageDecodersFile).code);
 
   console.log();
   console.log('### Cleaning js files');
@@ -903,25 +902,24 @@ gulp.task('lib', ['buildnumber'], function () {
     content = preprocessor2.preprocessPDFJSCode(ctx, content);
     content = babel.transform(content, {
       sourceType: 'module',
-      presets: noPreset ? undefined : ['env'],
+      presets: noPreset ? undefined : ['@babel/preset-env'],
       plugins: [
-        'transform-es2015-modules-commonjs',
-        ['transform-runtime', {
+        '@babel/plugin-transform-modules-commonjs',
+        ['@babel/plugin-transform-runtime', {
           'helpers': false,
-          'polyfill': false,
           'regenerator': true,
         }],
         babelPluginReplaceNonWebPackRequire,
       ],
     }).code;
-    var removeCjsSrc =
-      /^(var\s+\w+\s*=\s*require\('.*?)(?:\/src)(\/[^']*'\);)$/gm;
-    content = content.replace(removeCjsSrc, function (all, prefix, suffix) {
+    // eslint-disable-next-line max-len
+    var removeCjsSrc = /^(var\s+\w+\s*=\s*(_interopRequireDefault\()?require\(".*?)(?:\/src)(\/[^"]*"\)\)?;)$/gm;
+    content = content.replace(removeCjsSrc, (all, prefix, interop, suffix) => {
       return prefix + suffix;
     });
     return licenseHeaderLibre + content;
   }
-  var babel = require('babel-core');
+  var babel = require('@babel/core');
   var versionInfo = getVersionJSON();
   var ctx = {
     rootPath: __dirname,

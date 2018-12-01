@@ -212,10 +212,14 @@ class BaseViewer {
       return;
     }
     // The intent can be to just reset a scroll position and/or scale.
-    this._setCurrentPageNumber(val, /* resetCurrentPageView = */ true);
+    if (!this._setCurrentPageNumber(val, /* resetCurrentPageView = */ true)) {
+      console.error(
+        `${this._name}.currentPageNumber: "${val}" is not a valid page.`);
+    }
   }
 
   /**
+   * @return {boolean} Whether the pageNumber is valid (within bounds).
    * @private
    */
   _setCurrentPageNumber(val, resetCurrentPageView = false) {
@@ -223,13 +227,11 @@ class BaseViewer {
       if (resetCurrentPageView) {
         this._resetCurrentPageView();
       }
-      return;
+      return true;
     }
 
     if (!(0 < val && val <= this.pagesCount)) {
-      console.error(
-        `${this._name}._setCurrentPageNumber: "${val}" is out of bounds.`);
-      return;
+      return false;
     }
     this._currentPageNumber = val;
 
@@ -242,6 +244,7 @@ class BaseViewer {
     if (resetCurrentPageView) {
       this._resetCurrentPageView();
     }
+    return true;
   }
 
   /**
@@ -256,14 +259,21 @@ class BaseViewer {
    * @param {string} val - The page label.
    */
   set currentPageLabel(val) {
-    let pageNumber = val | 0; // Fallback page number.
+    if (!this.pdfDocument) {
+      return;
+    }
+    let page = val | 0; // Fallback page number.
     if (this._pageLabels) {
       let i = this._pageLabels.indexOf(val);
       if (i >= 0) {
-        pageNumber = i + 1;
+        page = i + 1;
       }
     }
-    this.currentPageNumber = pageNumber;
+    // The intent can be to just reset a scroll position and/or scale.
+    if (!this._setCurrentPageNumber(page, /* resetCurrentPageView = */ true)) {
+      console.error(
+        `${this._name}.currentPageLabel: "${val}" is not a valid page.`);
+    }
   }
 
   /**
@@ -279,7 +289,7 @@ class BaseViewer {
    */
   set currentScale(val) {
     if (isNaN(val)) {
-      throw new Error('Invalid numeric scale');
+      throw new Error('Invalid numeric scale.');
     }
     if (!this.pdfDocument) {
       return;
@@ -660,23 +670,21 @@ class BaseViewer {
    * Scrolls page into view.
    * @param {ScrollPageIntoViewParameters} params
    */
-  scrollPageIntoView(params) {
+  scrollPageIntoView({ pageNumber, destArray = null,
+                       allowNegativeOffset = false, }) {
     if (!this.pdfDocument) {
       return;
     }
-    let pageNumber = params.pageNumber || 0;
-    let dest = params.destArray || null;
-    let allowNegativeOffset = params.allowNegativeOffset || false;
-
-    if (this.isInPresentationMode || !dest) {
-      this._setCurrentPageNumber(pageNumber, /* resetCurrentPageView = */ true);
+    const pageView = (Number.isInteger(pageNumber) &&
+                      this._pages[pageNumber - 1]);
+    if (!pageView) {
+      console.error(`${this._name}.scrollPageIntoView: ` +
+        `"${pageNumber}" is not a valid pageNumber parameter.`);
       return;
     }
 
-    let pageView = this._pages[pageNumber - 1];
-    if (!pageView) {
-      console.error(
-        `${this._name}.scrollPageIntoView: Invalid "pageNumber" parameter.`);
+    if (this.isInPresentationMode || !destArray) {
+      this._setCurrentPageNumber(pageNumber, /* resetCurrentPageView = */ true);
       return;
     }
     let x = 0, y = 0;
@@ -687,11 +695,11 @@ class BaseViewer {
     let pageHeight = (changeOrientation ? pageView.width : pageView.height) /
       pageView.scale / CSS_UNITS;
     let scale = 0;
-    switch (dest[1].name) {
+    switch (destArray[1].name) {
       case 'XYZ':
-        x = dest[2];
-        y = dest[3];
-        scale = dest[4];
+        x = destArray[2];
+        y = destArray[3];
+        scale = destArray[4];
         // If x and/or y coordinates are not supplied, default to
         // _top_ left of the page (not the obvious bottom left,
         // since aligning the bottom of the intended page with the
@@ -705,7 +713,7 @@ class BaseViewer {
         break;
       case 'FitH':
       case 'FitBH':
-        y = dest[2];
+        y = destArray[2];
         scale = 'page-width';
         // According to the PDF spec, section 12.3.2.2, a `null` value in the
         // parameter should maintain the position relative to the new page.
@@ -716,16 +724,16 @@ class BaseViewer {
         break;
       case 'FitV':
       case 'FitBV':
-        x = dest[2];
+        x = destArray[2];
         width = pageWidth;
         height = pageHeight;
         scale = 'page-height';
         break;
       case 'FitR':
-        x = dest[2];
-        y = dest[3];
-        width = dest[4] - x;
-        height = dest[5] - y;
+        x = destArray[2];
+        y = destArray[3];
+        width = destArray[4] - x;
+        height = destArray[5] - y;
         let hPadding = this.removePageBorders ? 0 : SCROLLBAR_PADDING;
         let vPadding = this.removePageBorders ? 0 : VERTICAL_PADDING;
 
@@ -736,8 +744,8 @@ class BaseViewer {
         scale = Math.min(Math.abs(widthScale), Math.abs(heightScale));
         break;
       default:
-        console.error(`${this._name}.scrollPageIntoView: "${dest[1].name}" ` +
-                      'is not a valid destination type.');
+        console.error(`${this._name}.scrollPageIntoView: ` +
+          `"${destArray[1].name}" is not a valid destination type.`);
         return;
     }
 
@@ -747,7 +755,7 @@ class BaseViewer {
       this.currentScaleValue = DEFAULT_SCALE_VALUE;
     }
 
-    if (scale === 'page-fit' && !dest[4]) {
+    if (scale === 'page-fit' && !destArray[4]) {
       this._scrollIntoView({
         pageDiv: pageView.div,
         pageNumber,
@@ -1088,7 +1096,7 @@ class BaseViewer {
     if (this._currentScaleValue && isNaN(this._currentScaleValue)) {
       this._setScale(this._currentScaleValue, true);
     }
-    this.scrollPageIntoView({ pageNumber, });
+    this._setCurrentPageNumber(pageNumber, /* resetCurrentPageView = */ true);
     this.update();
   }
 
@@ -1148,7 +1156,7 @@ class BaseViewer {
     if (!pageNumber) {
       return;
     }
-    this.scrollPageIntoView({ pageNumber, });
+    this._setCurrentPageNumber(pageNumber, /* resetCurrentPageView = */ true);
     this.update();
   }
 }
