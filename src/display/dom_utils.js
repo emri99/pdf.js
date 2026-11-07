@@ -13,445 +13,418 @@
  * limitations under the License.
  */
 
-import {
-  assert, CMapCompressionType, removeNullCharacters, stringToBytes,
-  unreachable, Util, warn
-} from '../shared/util';
-
-const DEFAULT_LINK_REL = 'noopener noreferrer nofollow';
-const SVG_NS = 'http://www.w3.org/2000/svg';
-
-class DOMCanvasFactory {
-  create(width, height) {
-    if (width <= 0 || height <= 0) {
-      throw new Error('invalid canvas size');
-    }
-    let canvas = document.createElement('canvas');
-    let context = canvas.getContext('2d');
-    canvas.width = width;
-    canvas.height = height;
-    return {
-      canvas,
-      context,
-    };
-  }
-
-  reset(canvasAndContext, width, height) {
-    if (!canvasAndContext.canvas) {
-      throw new Error('canvas is not specified');
-    }
-    if (width <= 0 || height <= 0) {
-      throw new Error('invalid canvas size');
-    }
-    canvasAndContext.canvas.width = width;
-    canvasAndContext.canvas.height = height;
-  }
-
-  destroy(canvasAndContext) {
-    if (!canvasAndContext.canvas) {
-      throw new Error('canvas is not specified');
-    }
-    // Zeroing the width and height cause Firefox to release graphics
-    // resources immediately, which can greatly reduce memory consumption.
-    canvasAndContext.canvas.width = 0;
-    canvasAndContext.canvas.height = 0;
-    canvasAndContext.canvas = null;
-    canvasAndContext.context = null;
-  }
-}
-
-class DOMCMapReaderFactory {
-  constructor({ baseUrl = null, isCompressed = false, }) {
-    this.baseUrl = baseUrl;
-    this.isCompressed = isCompressed;
-  }
-
-  fetch({ name, }) {
-    if (!this.baseUrl) {
-      return Promise.reject(new Error(
-        'The CMap "baseUrl" parameter must be specified, ensure that ' +
-        'the "cMapUrl" and "cMapPacked" API parameters are provided.'));
-    }
-    if (!name) {
-      return Promise.reject(new Error('CMap name must be specified.'));
-    }
-    return new Promise((resolve, reject) => {
-      let url = this.baseUrl + name + (this.isCompressed ? '.bcmap' : '');
-
-      let request = new XMLHttpRequest();
-      request.open('GET', url, true);
-
-      if (this.isCompressed) {
-        request.responseType = 'arraybuffer';
-      }
-      request.onreadystatechange = () => {
-        if (request.readyState !== XMLHttpRequest.DONE) {
-          return;
-        }
-        if (request.status === 200 || request.status === 0) {
-          let data;
-          if (this.isCompressed && request.response) {
-            data = new Uint8Array(request.response);
-          } else if (!this.isCompressed && request.responseText) {
-            data = stringToBytes(request.responseText);
-          }
-          if (data) {
-            resolve({
-              cMapData: data,
-              compressionType: this.isCompressed ?
-                CMapCompressionType.BINARY : CMapCompressionType.NONE,
-            });
-            return;
-          }
-        }
-        reject(new Error('Unable to load ' +
-                         (this.isCompressed ? 'binary ' : '') +
-                         'CMap at: ' + url));
-      };
-
-      request.send(null);
-    });
-  }
-}
-
-class DOMSVGFactory {
-  create(width, height) {
-    assert(width > 0 && height > 0, 'Invalid SVG dimensions');
-
-    let svg = document.createElementNS(SVG_NS, 'svg:svg');
-    svg.setAttribute('version', '1.1');
-    svg.setAttribute('width', width + 'px');
-    svg.setAttribute('height', height + 'px');
-    svg.setAttribute('preserveAspectRatio', 'none');
-    svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
-
-    return svg;
-  }
-
-  createElement(type) {
-    assert(typeof type === 'string', 'Invalid SVG element type');
-
-    return document.createElementNS(SVG_NS, type);
-  }
-}
+import { shadow, stripPath, warn } from "../shared/util.js";
+import { getRGB } from "./display_utils.js";
+import { PageViewport } from "./page_viewport.js";
+import { XfaLayer } from "./xfa_layer.js";
 
 /**
- * @typedef {Object} PageViewportParameters
- * @property {Array} viewBox - The xMin, yMin, xMax and yMax coordinates.
- * @property {number} scale - The scale of the viewport.
- * @property {number} rotation - The rotation, in degrees, of the viewport.
- * @property {number} offsetX - (optional) The vertical, i.e. x-axis, offset.
- *   The default value is `0`.
- * @property {number} offsetY - (optional) The horizontal, i.e. y-axis, offset.
- *   The default value is `0`.
- * @property {boolean} dontFlip - (optional) If true, the x-axis will not be
- *   flipped. The default value is `false`.
+ * This file contains helper functions that:
+ *  - Directly, or indirectly, access the DOM.
+ *  - Are only invoked from code running in the main-thread.
  */
 
-/**
- * @typedef {Object} PageViewportCloneParameters
- * @property {number} scale - (optional) The scale, overriding the one in the
- *   cloned viewport. The default value is `this.scale`.
- * @property {number} rotation - (optional) The rotation, in degrees, overriding
- *   the one in the cloned viewport. The default value is `this.rotation`.
- * @property {boolean} dontFlip - (optional) If true, the x-axis will not be
- *   flipped. The default value is `false`.
- */
-
-/**
- * PDF page viewport created based on scale, rotation and offset.
- */
-class PageViewport {
-  /**
-   * @param {PageViewportParameters}
-   */
-  constructor({ viewBox, scale, rotation, offsetX = 0, offsetY = 0,
-                dontFlip = false, }) {
-    this.viewBox = viewBox;
-    this.scale = scale;
-    this.rotation = rotation;
-    this.offsetX = offsetX;
-    this.offsetY = offsetY;
-
-    // creating transform to convert pdf coordinate system to the normal
-    // canvas like coordinates taking in account scale and rotation
-    let centerX = (viewBox[2] + viewBox[0]) / 2;
-    let centerY = (viewBox[3] + viewBox[1]) / 2;
-    let rotateA, rotateB, rotateC, rotateD;
-    rotation = rotation % 360;
-    rotation = rotation < 0 ? rotation + 360 : rotation;
-    switch (rotation) {
-      case 180:
-        rotateA = -1; rotateB = 0; rotateC = 0; rotateD = 1;
-        break;
-      case 90:
-        rotateA = 0; rotateB = 1; rotateC = 1; rotateD = 0;
-        break;
-      case 270:
-        rotateA = 0; rotateB = -1; rotateC = -1; rotateD = 0;
-        break;
-      // case 0:
-      default:
-        rotateA = 1; rotateB = 0; rotateC = 0; rotateD = -1;
-        break;
+async function fetchData(url, type = "text") {
+  if (
+    (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) ||
+    isValidFetchUrl(url, document.baseURI)
+  ) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(response.statusText);
     }
-
-    if (dontFlip) {
-      rotateC = -rotateC; rotateD = -rotateD;
+    switch (type) {
+      case "blob":
+        return response.blob();
+      case "bytes":
+        return response.bytes();
+      case "json":
+        return response.json();
     }
-
-    let offsetCanvasX, offsetCanvasY;
-    let width, height;
-    if (rotateA === 0) {
-      offsetCanvasX = Math.abs(centerY - viewBox[1]) * scale + offsetX;
-      offsetCanvasY = Math.abs(centerX - viewBox[0]) * scale + offsetY;
-      width = Math.abs(viewBox[3] - viewBox[1]) * scale;
-      height = Math.abs(viewBox[2] - viewBox[0]) * scale;
-    } else {
-      offsetCanvasX = Math.abs(centerX - viewBox[0]) * scale + offsetX;
-      offsetCanvasY = Math.abs(centerY - viewBox[1]) * scale + offsetY;
-      width = Math.abs(viewBox[2] - viewBox[0]) * scale;
-      height = Math.abs(viewBox[3] - viewBox[1]) * scale;
-    }
-    // creating transform for the following operations:
-    // translate(-centerX, -centerY), rotate and flip vertically,
-    // scale, and translate(offsetCanvasX, offsetCanvasY)
-    this.transform = [
-      rotateA * scale,
-      rotateB * scale,
-      rotateC * scale,
-      rotateD * scale,
-      offsetCanvasX - rotateA * scale * centerX - rotateC * scale * centerY,
-      offsetCanvasY - rotateB * scale * centerX - rotateD * scale * centerY
-    ];
-
-    this.width = width;
-    this.height = height;
+    return response.text();
   }
 
-  /**
-   * Clones viewport, with optional additional properties.
-   * @param {PageViewportCloneParameters} - (optional)
-   * @return {PageViewport} Cloned viewport.
-   */
-  clone({ scale = this.scale, rotation = this.rotation,
-          dontFlip = false, } = {}) {
-    return new PageViewport({
-      viewBox: this.viewBox.slice(),
-      scale,
-      rotation,
-      offsetX: this.offsetX,
-      offsetY: this.offsetY,
-      dontFlip,
-    });
-  }
-
-  /**
-   * Converts PDF point to the viewport coordinates. For examples, useful for
-   * converting PDF location into canvas pixel coordinates.
-   * @param {number} x - The x-coordinate.
-   * @param {number} y - The y-coordinate.
-   * @return {Object} Object containing `x` and `y` properties of the
-   *   point in the viewport coordinate space.
-   * @see {@link convertToPdfPoint}
-   * @see {@link convertToViewportRectangle}
-   */
-  convertToViewportPoint(x, y) {
-    return Util.applyTransform([x, y], this.transform);
-  }
-
-  /**
-   * Converts PDF rectangle to the viewport coordinates.
-   * @param {Array} rect - The xMin, yMin, xMax and yMax coordinates.
-   * @return {Array} Array containing corresponding coordinates of the rectangle
-   *   in the viewport coordinate space.
-   * @see {@link convertToViewportPoint}
-   */
-  convertToViewportRectangle(rect) {
-    let tl = Util.applyTransform([rect[0], rect[1]], this.transform);
-    let br = Util.applyTransform([rect[2], rect[3]], this.transform);
-    return [tl[0], tl[1], br[0], br[1]];
-  }
-
-  /**
-   * Converts viewport coordinates to the PDF location. For examples, useful
-   * for converting canvas pixel location into PDF one.
-   * @param {number} x - The x-coordinate.
-   * @param {number} y - The y-coordinate.
-   * @return {Object} Object containing `x` and `y` properties of the
-   *   point in the PDF coordinate space.
-   * @see {@link convertToViewportPoint}
-   */
-  convertToPdfPoint(x, y) {
-    return Util.applyInverseTransform([x, y], this.transform);
-  }
-}
-
-var RenderingCancelledException = (function RenderingCancelledException() {
-  function RenderingCancelledException(msg, type) {
-    this.message = msg;
-    this.type = type;
-  }
-
-  RenderingCancelledException.prototype = new Error();
-  RenderingCancelledException.prototype.name = 'RenderingCancelledException';
-  RenderingCancelledException.constructor = RenderingCancelledException;
-
-  return RenderingCancelledException;
-})();
-
-const LinkTarget = {
-  NONE: 0, // Default value.
-  SELF: 1,
-  BLANK: 2,
-  PARENT: 3,
-  TOP: 4,
-};
-
-const LinkTargetStringMap = [
-  '',
-  '_self',
-  '_blank',
-  '_parent',
-  '_top'
-];
-
-/**
- * @typedef ExternalLinkParameters
- * @typedef {Object} ExternalLinkParameters
- * @property {string} url - An absolute URL.
- * @property {LinkTarget} target - (optional) The link target.
- *   The default value is `LinkTarget.NONE`.
- * @property {string} rel - (optional) The link relationship.
- *   The default value is `DEFAULT_LINK_REL`.
- */
-
-/**
- * Adds various attributes (href, title, target, rel) to hyperlinks.
- * @param {HTMLLinkElement} link - The link element.
- * @param {ExternalLinkParameters} params
- */
-function addLinkAttributes(link, { url, target, rel, } = {}) {
-  link.href = link.title = (url ? removeNullCharacters(url) : '');
-
-  if (url) {
-    const LinkTargetValues = Object.values(LinkTarget);
-    let targetIndex =
-      LinkTargetValues.includes(target) ? target : LinkTarget.NONE;
-    link.target = LinkTargetStringMap[targetIndex];
-
-    link.rel = (typeof rel === 'string' ? rel : DEFAULT_LINK_REL);
-  }
-}
-
-// Gets the file name from a given URL.
-function getFilenameFromUrl(url) {
-  var anchor = url.indexOf('#');
-  var query = url.indexOf('?');
-  var end = Math.min(
-    anchor > 0 ? anchor : url.length,
-    query > 0 ? query : url.length);
-  return url.substring(url.lastIndexOf('/', end) + 1, end);
-}
-
-class StatTimer {
-  constructor(enable = true) {
-    this.enabled = !!enable;
-    this.started = Object.create(null);
-    this.times = [];
-  }
-
-  time(name) {
-    if (!this.enabled) {
-      return;
-    }
-    if (name in this.started) {
-      warn('Timer is already running for ' + name);
-    }
-    this.started[name] = Date.now();
-  }
-
-  timeEnd(name) {
-    if (!this.enabled) {
-      return;
-    }
-    if (!(name in this.started)) {
-      warn('Timer has not been started for ' + name);
-    }
-    this.times.push({
-      'name': name,
-      'start': this.started[name],
-      'end': Date.now(),
-    });
-    // Remove timer from started so it can be called again.
-    delete this.started[name];
-  }
-
-  toString() {
-    let times = this.times;
-    // Find the longest name for padding purposes.
-    let out = '', longest = 0;
-    for (let i = 0, ii = times.length; i < ii; ++i) {
-      let name = times[i]['name'];
-      if (name.length > longest) {
-        longest = name.length;
-      }
-    }
-    for (let i = 0, ii = times.length; i < ii; ++i) {
-      let span = times[i];
-      let duration = span.end - span.start;
-      out += `${span['name'].padEnd(longest)} ${duration}ms\n`;
-    }
-    return out;
-  }
-}
-
-/**
- * Helps avoid having to initialize {StatTimer} instances, e.g. one for every
- * page, in cases where the collected stats are not actually being used.
- * This (dummy) class can thus, since all its methods are `static`, be directly
- * shared between multiple call-sites without the need to be initialized first.
- *
- * NOTE: This must implement the same interface as {StatTimer}.
- */
-class DummyStatTimer {
-  constructor() {
-    unreachable('Cannot initialize DummyStatTimer.');
-  }
-
-  static time(name) {}
-
-  static timeEnd(name) {}
-
-  static toString() {
-    return '';
-  }
-}
-
-function loadScript(src) {
+  // The Fetch API is not supported.
   return new Promise((resolve, reject) => {
-    let script = document.createElement('script');
-    script.src = src;
+    const request = new XMLHttpRequest();
+    request.open("GET", url, /* async = */ true);
+    request.responseType = type === "bytes" ? "arraybuffer" : type;
 
-    script.onload = resolve;
-    script.onerror = function() {
-      reject(new Error(`Cannot load script at: ${script.src}`));
+    request.onreadystatechange = () => {
+      if (request.readyState !== XMLHttpRequest.DONE) {
+        return;
+      }
+      if (request.status === 200 || request.status === 0) {
+        switch (type) {
+          case "bytes":
+            resolve(new Uint8Array(request.response));
+            return;
+          case "blob":
+          case "json":
+            resolve(request.response);
+            return;
+        }
+        resolve(request.responseText);
+        return;
+      }
+      reject(new Error(request.statusText));
     };
-    (document.head || document.documentElement).appendChild(script);
+
+    request.send(null);
   });
 }
 
+function isDataScheme(url) {
+  const ii = url.length;
+  let i = 0;
+  while (i < ii && url[i].trim() === "") {
+    i++;
+  }
+  return url.substring(i, i + 5).toLowerCase() === "data:";
+}
+
+function isPdfFile(filename) {
+  return typeof filename === "string" && /\.pdf$/i.test(filename);
+}
+
+/**
+ * Gets the filename from a given URL.
+ * @param {string} url
+ * @returns {string}
+ */
+function getFilenameFromUrl(url) {
+  [url] = url.split(/[#?]/, 1);
+  return stripPath(url);
+}
+
+/**
+ * Returns the filename or guessed filename from the url (see issue 3455).
+ * @param {string} url - The original PDF location.
+ * @param {string} defaultFilename - The value returned if the filename is
+ *   unknown, or the protocol is unsupported.
+ * @returns {string} Guessed PDF filename.
+ */
+function getPdfFilenameFromUrl(url, defaultFilename = "document.pdf") {
+  if (typeof url !== "string") {
+    return defaultFilename;
+  }
+  if (isDataScheme(url)) {
+    warn('getPdfFilenameFromUrl: ignore "data:"-URL for performance reasons.');
+    return defaultFilename;
+  }
+
+  const getURL = urlString => {
+    try {
+      return new URL(urlString);
+    } catch {}
+    try {
+      return new URL(decodeURIComponent(urlString));
+    } catch {}
+    try {
+      // Attempt to parse the URL using the document's base URI.
+      return new URL(urlString, "https://foo.bar");
+    } catch {}
+    try {
+      return new URL(decodeURIComponent(urlString), "https://foo.bar");
+    } catch {}
+
+    return null;
+  };
+
+  const newURL = getURL(url);
+  if (!newURL) {
+    // If the URL is invalid, return the default filename.
+    return defaultFilename;
+  }
+
+  const decode = name => {
+    try {
+      let decoded = decodeURIComponent(name);
+      if (decoded.includes("/")) {
+        decoded = stripPath(decoded);
+        // Ignore the decoded name if it's identical to ".pdf".
+        if (decoded.length === 4 && pdfRegex.test(decoded)) {
+          return name;
+        }
+      }
+      return decoded;
+    } catch {
+      return name;
+    }
+  };
+
+  const pdfRegex = /\.pdf$/i;
+  const filename = stripPath(newURL.pathname);
+  if (pdfRegex.test(filename)) {
+    return decode(filename);
+  }
+
+  if (newURL.searchParams.size > 0) {
+    const getLast = iterator => [...iterator].findLast(v => pdfRegex.test(v));
+
+    // If any of the search parameters ends with ".pdf", return it.
+    const name =
+      getLast(newURL.searchParams.values()) ??
+      getLast(newURL.searchParams.keys());
+    if (name) {
+      return decode(name);
+    }
+  }
+
+  if (newURL.hash) {
+    // Locate the last ".pdf" and then extend it to the left, up to the closest
+    // separator. Both steps are linear, whereas a single pattern starting with
+    // `[^/?#=]+` is quadratic on a hash which contains no ".pdf" at all.
+    const { hash } = newURL;
+    let extensionStart = -1;
+    for (const { index } of hash.matchAll(/\.pdf\b/gi)) {
+      extensionStart = index;
+    }
+    if (extensionStart > 0) {
+      let filenameStart = extensionStart;
+      while (filenameStart > 0 && !"/?#=".includes(hash[filenameStart - 1])) {
+        filenameStart--;
+      }
+      if (filenameStart < extensionStart) {
+        return decode(hash.slice(filenameStart, extensionStart + 4));
+      }
+    }
+  }
+
+  return defaultFilename;
+}
+
+function isValidFetchUrl(url, baseUrl) {
+  if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
+    throw new Error("Not implemented: isValidFetchUrl");
+  }
+  const res = baseUrl ? URL.parse(url, baseUrl) : URL.parse(url);
+  // The Fetch API only supports the http/https protocols, and not file/ftp.
+  return /https?:/.test(res?.protocol ?? "");
+}
+
+/**
+ * Event handler to suppress context menu.
+ */
+function noContextMenu(e) {
+  e.preventDefault();
+}
+
+function stopEvent(e) {
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+class PDFDateString {
+  static #regex;
+
+  /**
+   * Convert a PDF date string to a JavaScript `Date` object.
+   *
+   * The PDF date string format is described in section 7.9.4 of the official
+   * PDF 32000-1:2008 specification. However, in the PDF 1.7 reference (sixth
+   * edition) Adobe describes the same format including a trailing apostrophe.
+   * This syntax in incorrect, but Adobe Acrobat creates PDF files that contain
+   * them. We ignore all apostrophes as they are not necessary for date parsing.
+   *
+   * Moreover, Adobe Acrobat doesn't handle changing the date to universal time
+   * and doesn't use the user's time zone (effectively ignoring the HH' and mm'
+   * parts of the date string).
+   * @param {string} input
+   * @returns {Date|null}
+   */
+  static toDateObject(input) {
+    if (input instanceof Date) {
+      return input;
+    }
+    if (!input || typeof input !== "string") {
+      return null;
+    }
+
+    // Lazily initialize the regular expression.
+    this.#regex ||= new RegExp(
+      "^D:" + // Prefix (required)
+        "(\\d{4})" + // Year (required)
+        "(\\d{2})?" + // Month (optional)
+        "(\\d{2})?" + // Day (optional)
+        "(\\d{2})?" + // Hour (optional)
+        "(\\d{2})?" + // Minute (optional)
+        "(\\d{2})?" + // Second (optional)
+        "([Z|+\\-])?" + // Universal time relation (optional)
+        "(\\d{2})?" + // Offset hour (optional)
+        "'?" + // Splitting apostrophe (optional)
+        "(\\d{2})?" + // Offset minute (optional)
+        "'?" // Trailing apostrophe (optional)
+    );
+
+    // Optional fields that don't satisfy the requirements from the regular
+    // expression (such as incorrect digit counts or numbers that are out of
+    // range) will fall back the defaults from the specification.
+    const matches = this.#regex.exec(input);
+    if (!matches) {
+      return null;
+    }
+
+    // JavaScript's `Date` object expects the month to be between 0 and 11
+    // instead of 1 and 12, so we have to correct for that.
+    const year = parseInt(matches[1], 10);
+    let month = parseInt(matches[2], 10);
+    month = month >= 1 && month <= 12 ? month - 1 : 0;
+    let day = parseInt(matches[3], 10);
+    day = day >= 1 && day <= 31 ? day : 1;
+    let hour = parseInt(matches[4], 10);
+    hour = hour >= 0 && hour <= 23 ? hour : 0;
+    let minute = parseInt(matches[5], 10);
+    minute = minute >= 0 && minute <= 59 ? minute : 0;
+    let second = parseInt(matches[6], 10);
+    second = second >= 0 && second <= 59 ? second : 0;
+    const universalTimeRelation = matches[7] || "Z";
+    let offsetHour = parseInt(matches[8], 10);
+    offsetHour = offsetHour >= 0 && offsetHour <= 23 ? offsetHour : 0;
+    let offsetMinute = parseInt(matches[9], 10) || 0;
+    offsetMinute = offsetMinute >= 0 && offsetMinute <= 59 ? offsetMinute : 0;
+
+    // Universal time relation 'Z' means that the local time is equal to the
+    // universal time, whereas the relations '+'/'-' indicate that the local
+    // time is later respectively earlier than the universal time. Every date
+    // is normalized to universal time.
+    if (universalTimeRelation === "-") {
+      hour += offsetHour;
+      minute += offsetMinute;
+    } else if (universalTimeRelation === "+") {
+      hour -= offsetHour;
+      minute -= offsetMinute;
+    }
+
+    return new Date(Date.UTC(year, month, day, hour, minute, second));
+  }
+}
+
+function getColorValues(colors) {
+  const span = document.createElement("span");
+  span.style.visibility = "hidden";
+  // NOTE: The following does *not* affect `forced-colors: active` mode.
+  span.style.colorScheme = "only light";
+  document.body.append(span);
+  for (const name of colors.keys()) {
+    span.style.color = name;
+    const computedColor = window.getComputedStyle(span).color;
+    colors.set(name, getRGB(computedColor));
+  }
+  span.remove();
+}
+
+/**
+ * @param {HTMLDivElement} div
+ * @param {PageViewport} viewport
+ * @param {boolean} mustFlip
+ * @param {boolean} mustRotate
+ */
+function setLayerDimensions(
+  div,
+  viewport,
+  mustFlip = false,
+  mustRotate = true
+) {
+  if (viewport instanceof PageViewport) {
+    const { pageWidth, pageHeight } = viewport.rawDims;
+    const { style } = div;
+
+    const widthStr = `round(down, var(--total-scale-factor) * ${pageWidth}px, var(--scale-round-x))`,
+      heightStr = `round(down, var(--total-scale-factor) * ${pageHeight}px, var(--scale-round-y))`;
+
+    if (!mustFlip || viewport.rotation % 180 === 0) {
+      style.width = widthStr;
+      style.height = heightStr;
+    } else {
+      style.width = heightStr;
+      style.height = widthStr;
+    }
+  }
+
+  if (mustRotate) {
+    div.setAttribute("data-main-rotation", viewport.rotation);
+  }
+}
+
+// See https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Image_types
+// to know which types are supported by the browser.
+const SupportedImageMimeTypes = new Set([
+  "image/apng",
+  "image/avif",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/svg+xml",
+  "image/webp",
+  "image/x-icon",
+]);
+
+class ColorScheme {
+  static get isDarkMode() {
+    return shadow(
+      this,
+      "isDarkMode",
+      !!window?.matchMedia?.("(prefers-color-scheme: dark)").matches
+    );
+  }
+}
+
+class CSSConstants {
+  static get commentForegroundColor() {
+    const element = document.createElement("span");
+    element.classList.add("comment", "sidebar");
+    const { style } = element;
+    style.width = style.height = "0";
+    style.display = "none";
+    style.color = "var(--comment-fg-color)";
+    document.body.append(element);
+    const { color } = window.getComputedStyle(element);
+    element.remove();
+    return shadow(this, "commentForegroundColor", getRGB(color));
+  }
+}
+
+function renderRichText({ html, dir, className }, container) {
+  const fragment = document.createDocumentFragment();
+  if (typeof html === "string") {
+    const p = document.createElement("p");
+    p.dir = dir || "auto";
+    const lines = html.split(/\r\n?|\n/);
+    for (let i = 0, ii = lines.length; i < ii; ++i) {
+      const line = lines[i];
+      p.append(document.createTextNode(line));
+      if (i < ii - 1) {
+        p.append(document.createElement("br"));
+      }
+    }
+    fragment.append(p);
+  } else {
+    XfaLayer.render({
+      xfaHtml: html,
+      div: fragment,
+      intent: "richText",
+    });
+  }
+  fragment.firstElementChild.classList.add("richText", className);
+  container.append(fragment);
+}
+
 export {
-  PageViewport,
-  RenderingCancelledException,
-  addLinkAttributes,
+  ColorScheme,
+  CSSConstants,
+  fetchData,
+  getColorValues,
   getFilenameFromUrl,
-  LinkTarget,
-  DEFAULT_LINK_REL,
-  DOMCanvasFactory,
-  DOMCMapReaderFactory,
-  DOMSVGFactory,
-  StatTimer,
-  DummyStatTimer,
-  loadScript,
+  getPdfFilenameFromUrl,
+  isDataScheme,
+  isPdfFile,
+  isValidFetchUrl,
+  noContextMenu,
+  PDFDateString,
+  renderRichText,
+  setLayerDimensions,
+  stopEvent,
+  SupportedImageMimeTypes,
 };

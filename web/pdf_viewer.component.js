@@ -12,47 +12,79 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* eslint-disable no-unused-vars */
 
+import { FindState, PDFFindController } from "./pdf_find_controller.js";
 import {
-  AnnotationLayerBuilder, DefaultAnnotationLayerFactory
-} from './annotation_layer_builder.js';
-import {
-  DefaultTextLayerFactory, TextLayerBuilder
-} from './text_layer_builder.js';
-import {
-  EventBus, getGlobalEventBus, NullL10n, ProgressBar
-} from './ui_utils.js';
-import { PDFLinkService, SimpleLinkService } from './pdf_link_service.js';
-import { DownloadManager } from './download_manager.js';
-import { GenericL10n } from './genericl10n.js';
-import { PDFFindController } from './pdf_find_controller.js';
-import { PDFHistory } from './pdf_history.js';
-import { PDFPageView } from './pdf_page_view.js';
-import { PDFSinglePageViewer } from './pdf_single_page_viewer';
-import { PDFViewer } from './pdf_viewer.js';
-
-const pdfjsVersion = PDFJSDev.eval('BUNDLE_VERSION');
-const pdfjsBuild = PDFJSDev.eval('BUNDLE_BUILD');
-
-// For backwards compatibility, ensure that events are re-dispatched to the DOM.
-getGlobalEventBus(/* dispatchToDOM = */ true);
-
-export {
-  PDFViewer,
-  PDFSinglePageViewer,
-  PDFPageView,
+  LinkTarget,
   PDFLinkService,
   SimpleLinkService,
-  TextLayerBuilder,
-  DefaultTextLayerFactory,
-  AnnotationLayerBuilder,
-  DefaultAnnotationLayerFactory,
-  PDFHistory,
-  PDFFindController,
-  EventBus,
-  DownloadManager,
+} from "./pdf_link_service.js";
+import {
+  parseQueryString,
   ProgressBar,
+  ScrollMode,
+  SpreadMode,
+} from "./ui_utils.js";
+import { AnnotationLayerBuilder } from "./annotation_layer_builder.js";
+import { DownloadManager } from "./download_manager.js";
+import { EventBus } from "./event_utils.js";
+import { GenericL10n } from "./genericl10n.js";
+import { PDFHistory } from "./pdf_history.js";
+import { PDFPageView } from "./pdf_page_view.js";
+import { PDFScriptingManager } from "./pdf_scripting_manager.component.js";
+import { PDFSinglePageViewer } from "./pdf_single_page_viewer.js";
+import { PDFViewer } from "./pdf_viewer.js";
+import { RenderingStates } from "./renderable_view.js";
+import { StructTreeLayerBuilder } from "./struct_tree_layer_builder.js";
+import { TextLayerBuilder } from "./text_layer_builder.js";
+import { XfaLayerBuilder } from "./xfa_layer_builder.js";
+
+globalThis.pdfjsViewer = {
+  AnnotationLayerBuilder,
+  DownloadManager,
+  EventBus,
+  FindState,
   GenericL10n,
-  NullL10n,
+  LinkTarget,
+  parseQueryString,
+  PDFFindController,
+  PDFHistory,
+  PDFLinkService,
+  PDFPageView,
+  PDFScriptingManager,
+  PDFSinglePageViewer,
+  PDFViewer,
+  ProgressBar,
+  RenderingStates,
+  ScrollMode,
+  SimpleLinkService,
+  SpreadMode,
+  StructTreeLayerBuilder,
+  TextLayerBuilder,
+  XfaLayerBuilder,
+};
+
+export {
+  AnnotationLayerBuilder,
+  DownloadManager,
+  EventBus,
+  FindState,
+  GenericL10n,
+  LinkTarget,
+  parseQueryString,
+  PDFFindController,
+  PDFHistory,
+  PDFLinkService,
+  PDFPageView,
+  PDFScriptingManager,
+  PDFSinglePageViewer,
+  PDFViewer,
+  ProgressBar,
+  RenderingStates,
+  ScrollMode,
+  SimpleLinkService,
+  SpreadMode,
+  StructTreeLayerBuilder,
+  TextLayerBuilder,
+  XfaLayerBuilder,
 };

@@ -14,349 +14,729 @@
  */
 
 import {
-  Cmd, Dict, isCmd, isDict, isName, isRef, isRefsEqual, Name, Ref, RefSet
-} from '../../src/core/primitives';
-import { XRefMock } from './test_utils';
+  Cmd,
+  Dict,
+  isCmd,
+  isDict,
+  isName,
+  isRefsEqual,
+  Name,
+  Ref,
+  RefMap,
+  RefSet,
+} from "../../src/core/primitives.js";
+import { StringStream } from "../../src/core/stream.js";
+import { XRefMock } from "./test_utils.js";
 
-describe('primitives', function() {
-  describe('Name', function() {
-    it('should retain the given name', function() {
-      var givenName = 'Font';
-      var name = Name.get(givenName);
+describe("primitives", function () {
+  describe("Name", function () {
+    it("should retain the given name", function () {
+      const givenName = "Font";
+      const name = Name.get(givenName);
       expect(name.name).toEqual(givenName);
     });
 
-    it('should create only one object for a name and cache it', function () {
-      var firstFont = Name.get('Font');
-      var secondFont = Name.get('Font');
-      var firstSubtype = Name.get('Subtype');
-      var secondSubtype = Name.get('Subtype');
+    it("should create only one object for a name and cache it", function () {
+      const firstFont = Name.get("Font");
+      const secondFont = Name.get("Font");
+      const firstSubtype = Name.get("Subtype");
+      const secondSubtype = Name.get("Subtype");
 
       expect(firstFont).toBe(secondFont);
       expect(firstSubtype).toBe(secondSubtype);
       expect(firstFont).not.toBe(firstSubtype);
     });
+
+    it("should create only one object for *empty* names and cache it", function () {
+      const firstEmpty = Name.get("");
+      const secondEmpty = Name.get("");
+      const normalName = Name.get("string");
+
+      expect(firstEmpty).toBe(secondEmpty);
+      expect(firstEmpty).not.toBe(normalName);
+    });
+
+    it("should not accept to create a non-string name", function () {
+      expect(function () {
+        Name.get(123);
+      }).toThrowError('Name: The "name" must be a string.');
+    });
   });
 
-  describe('Cmd', function() {
-    it('should retain the given cmd name', function() {
-      var givenCmd = 'BT';
-      var cmd = Cmd.get(givenCmd);
+  describe("Cmd", function () {
+    it("should retain the given cmd name", function () {
+      const givenCmd = "BT";
+      const cmd = Cmd.get(givenCmd);
       expect(cmd.cmd).toEqual(givenCmd);
     });
 
-    it('should create only one object for a command and cache it', function() {
-      var firstBT = Cmd.get('BT');
-      var secondBT = Cmd.get('BT');
-      var firstET = Cmd.get('ET');
-      var secondET = Cmd.get('ET');
+    it("should create only one object for a command and cache it", function () {
+      const firstBT = Cmd.get("BT");
+      const secondBT = Cmd.get("BT");
+      const firstET = Cmd.get("ET");
+      const secondET = Cmd.get("ET");
 
       expect(firstBT).toBe(secondBT);
       expect(firstET).toBe(secondET);
       expect(firstBT).not.toBe(firstET);
     });
+
+    it("should not accept to create a non-string cmd", function () {
+      expect(function () {
+        Cmd.get(123);
+      }).toThrowError('Cmd: The "cmd" must be a string.');
+    });
   });
 
-  describe('Dict', function() {
-    var checkInvalidHasValues = function(dict) {
-      expect(dict.has()).toBeFalsy();
-      expect(dict.has('Prev')).toBeFalsy();
+  describe("Dict", function () {
+    const checkInvalidHasValues = function (dict) {
+      expect(dict.has()).toBeFalse();
+      expect(dict.has("Prev")).toBeFalse();
     };
 
-    var checkInvalidKeyValues = function(dict) {
+    const checkInvalidKeyValues = function (dict) {
       expect(dict.get()).toBeUndefined();
-      expect(dict.get('Prev')).toBeUndefined();
-      expect(dict.get('Decode', 'D')).toBeUndefined();
-
-      // Note that the getter with three arguments breaks the pattern here.
-      expect(dict.get('FontFile', 'FontFile2', 'FontFile3')).toBeNull();
+      expect(dict.get("Prev")).toBeUndefined();
+      expect(dict.get("D", "Decode")).toBeUndefined();
+      expect(dict.get("FontFile", "FontFile2")).toBeUndefined();
     };
 
-    var emptyDict, dictWithSizeKey, dictWithManyKeys;
-    var storedSize = 42;
-    var testFontFile = 'file1';
-    var testFontFile2 = 'file2';
-    var testFontFile3 = 'file3';
+    let emptyDict, dictWithSizeKey, dictWithManyKeys;
+    const storedSize = 42;
+    const testFontFile = "file1";
+    const testFontFile2 = "file2";
 
-    beforeAll(function (done) {
+    beforeAll(function () {
       emptyDict = new Dict();
 
       dictWithSizeKey = new Dict();
-      dictWithSizeKey.set('Size', storedSize);
+      dictWithSizeKey.set("Size", storedSize);
 
       dictWithManyKeys = new Dict();
-      dictWithManyKeys.set('FontFile', testFontFile);
-      dictWithManyKeys.set('FontFile2', testFontFile2);
-      dictWithManyKeys.set('FontFile3', testFontFile3);
-
-      done();
+      dictWithManyKeys.set("FontFile", testFontFile);
+      dictWithManyKeys.set("FontFile2", testFontFile2);
     });
 
     afterAll(function () {
       emptyDict = dictWithSizeKey = dictWithManyKeys = null;
     });
 
-    it('should return invalid values for unknown keys', function() {
+    it("should not allow cloning of a dictionary", function () {
+      expect(function () {
+        structuredClone(dictWithSizeKey);
+      }).toThrowError();
+    });
+
+    it("should allow assigning an XRef table after creation", function () {
+      const dict = new Dict(null);
+      expect(dict.xref).toBeNull();
+
+      const xref = new XRefMock();
+      dict.assignXref(xref);
+      expect(dict.xref).toEqual(xref);
+    });
+
+    it("should return correct size", function () {
+      const dict = new Dict(null);
+      expect(dict.size).toEqual(0);
+
+      dict.set("Type", Name.get("Page"));
+      expect(dict.size).toEqual(1);
+
+      dict.set("Contents", Ref.get(10, 0));
+      expect(dict.size).toEqual(2);
+    });
+
+    it("should return invalid values for unknown keys", function () {
       checkInvalidHasValues(emptyDict);
       checkInvalidKeyValues(emptyDict);
     });
 
-    it('should return correct value for stored Size key', function() {
-      expect(dictWithSizeKey.has('Size')).toBeTruthy();
+    it("should return correct value for stored Size key", function () {
+      expect(dictWithSizeKey.has("Size")).toBeTrue();
 
-      expect(dictWithSizeKey.get('Size')).toEqual(storedSize);
-      expect(dictWithSizeKey.get('Prev', 'Size')).toEqual(storedSize);
-      expect(dictWithSizeKey.get('Prev', 'Root', 'Size')).toEqual(storedSize);
+      expect(dictWithSizeKey.get("Size")).toEqual(storedSize);
+      expect(dictWithSizeKey.get("Prev", "Size")).toEqual(storedSize);
     });
 
-    it('should return invalid values for unknown keys when Size key is stored',
-       function() {
+    it("should return invalid values for unknown keys when Size key is stored", function () {
       checkInvalidHasValues(dictWithSizeKey);
       checkInvalidKeyValues(dictWithSizeKey);
     });
 
-    it('should return correct value for stored Size key with undefined value',
-       function() {
-      var dict = new Dict();
-      dict.set('Size');
+    it("should not allow getting incorrectly ordered keys", function () {
+      expect(function () {
+        dictWithSizeKey.get("Decode", "D");
+      }).toThrowError("Dict.#getValue: Expected keys to be ordered by length.");
+    });
 
-      expect(dict.has('Size')).toBeTruthy();
+    it("should not accept to set a non-string key", function () {
+      const dict = new Dict();
+      expect(function () {
+        dict.set(123, "val");
+      }).toThrowError('Dict.set: The "key" must be a string.');
+
+      expect(dict.has(123)).toBeFalse();
 
       checkInvalidKeyValues(dict);
     });
 
-    it('should return correct values for multiple stored keys', function() {
-      expect(dictWithManyKeys.has('FontFile')).toBeTruthy();
-      expect(dictWithManyKeys.has('FontFile2')).toBeTruthy();
-      expect(dictWithManyKeys.has('FontFile3')).toBeTruthy();
+    it("should not accept to set a key with an undefined value", function () {
+      const dict = new Dict();
+      expect(function () {
+        dict.set("Size");
+      }).toThrowError('Dict.set: The "value" cannot be undefined.');
 
-      expect(dictWithManyKeys.get('FontFile3')).toEqual(testFontFile3);
-      expect(dictWithManyKeys.get('FontFile2', 'FontFile3'))
-                             .toEqual(testFontFile2);
-      expect(dictWithManyKeys.get('FontFile', 'FontFile2', 'FontFile3'))
-                             .toEqual(testFontFile);
+      expect(dict.has("Size")).toBeFalse();
+
+      checkInvalidKeyValues(dict);
     });
 
-    it('should asynchronously fetch unknown keys', function (done) {
-      var keyPromises = [
-        dictWithManyKeys.getAsync('Size'),
-        dictWithSizeKey.getAsync('FontFile', 'FontFile2', 'FontFile3')
+    it("should return correct values for multiple stored keys", function () {
+      expect(dictWithManyKeys.has("FontFile")).toBeTrue();
+      expect(dictWithManyKeys.has("FontFile2")).toBeTrue();
+
+      expect(dictWithManyKeys.get("FontFile", "FontFile2")).toEqual(
+        testFontFile
+      );
+    });
+
+    it("should asynchronously fetch unknown keys", async function () {
+      const keyPromises = [
+        dictWithManyKeys.getAsync("Size"),
+        dictWithSizeKey.getAsync("FontFile", "FontFile2"),
       ];
 
-      Promise.all(keyPromises).then(function (values) {
-        expect(values[0]).toBeUndefined();
-        expect(values[1]).toBeNull();
-        done();
-      }).catch(function (reason) {
-        done.fail(reason);
-      });
+      const values = await Promise.all(keyPromises);
+      expect(values[0]).toBeUndefined();
+      expect(values[1]).toBeUndefined();
     });
 
-    it('should asynchronously fetch correct values for multiple stored keys',
-        function (done) {
-      var keyPromises = [
-        dictWithManyKeys.getAsync('FontFile3'),
-        dictWithManyKeys.getAsync('FontFile2', 'FontFile3'),
-        dictWithManyKeys.getAsync('FontFile', 'FontFile2', 'FontFile3')
+    it("should asynchronously fetch correct values for multiple stored keys", async function () {
+      const keyPromises = [
+        dictWithManyKeys.getAsync("FontFile2"),
+        dictWithManyKeys.getAsync("FontFile", "FontFile2"),
       ];
 
-      Promise.all(keyPromises).then(function (values) {
-        expect(values[0]).toEqual(testFontFile3);
-        expect(values[1]).toEqual(testFontFile2);
-        expect(values[2]).toEqual(testFontFile);
-        done();
-      }).catch(function (reason) {
-        done.fail(reason);
-      });
+      const values = await Promise.all(keyPromises);
+      expect(values[0]).toEqual(testFontFile2);
+      expect(values[1]).toEqual(testFontFile);
     });
 
-    it('should callback for each stored key', function() {
-      var callbackSpy = jasmine.createSpy('spy on callback in dictionary');
-
-      dictWithManyKeys.forEach(callbackSpy);
-
-      expect(callbackSpy).toHaveBeenCalled();
-      var callbackSpyCalls = callbackSpy.calls;
-      expect(callbackSpyCalls.argsFor(0)).toEqual(['FontFile', testFontFile]);
-      expect(callbackSpyCalls.argsFor(1)).toEqual(['FontFile2', testFontFile2]);
-      expect(callbackSpyCalls.argsFor(2)).toEqual(['FontFile3', testFontFile3]);
-      expect(callbackSpyCalls.count()).toEqual(3);
-    });
-
-    it('should handle keys pointing to indirect objects, both sync and async',
-        function (done) {
-      var fontRef = new Ref(1, 0);
-      var xref = new XRefMock([
-        { ref: fontRef, data: testFontFile, }
+    it("should iterate through each stored key", function () {
+      expect([...dictWithManyKeys]).toEqual([
+        ["FontFile", testFontFile],
+        ["FontFile2", testFontFile2],
       ]);
-      var fontDict = new Dict(xref);
-      fontDict.set('FontFile', fontRef);
-
-      expect(fontDict.getRaw('FontFile')).toEqual(fontRef);
-      expect(fontDict.get('FontFile', 'FontFile2', 'FontFile3')).
-        toEqual(testFontFile);
-
-      fontDict.getAsync('FontFile', 'FontFile2', 'FontFile3').then(
-          function (value) {
-        expect(value).toEqual(testFontFile);
-        done();
-      }).catch(function (reason) {
-        done.fail(reason);
-      });
     });
 
-    it('should handle arrays containing indirect objects', function () {
-      var minCoordRef = new Ref(1, 0), maxCoordRef = new Ref(2, 0);
-      var minCoord = 0, maxCoord = 1;
-      var xref = new XRefMock([
-        { ref: minCoordRef, data: minCoord, },
-        { ref: maxCoordRef, data: maxCoord, }
+    it("should handle keys pointing to indirect objects, both sync and async", async function () {
+      const fontRef = Ref.get(1, 0);
+      const xref = new XRefMock([{ ref: fontRef, data: testFontFile }]);
+      const fontDict = new Dict(xref);
+      fontDict.set("FontFile", fontRef);
+
+      expect(fontDict.getRaw("FontFile")).toEqual(fontRef);
+      expect(fontDict.get("FontFile", "FontFile2")).toEqual(testFontFile);
+
+      const value = await fontDict.getAsync("FontFile", "FontFile2");
+      expect(value).toEqual(testFontFile);
+    });
+
+    it("should handle arrays containing indirect objects", function () {
+      const minCoordRef = Ref.get(1, 0);
+      const maxCoordRef = Ref.get(2, 0);
+      const minCoord = 0;
+      const maxCoord = 1;
+      const xref = new XRefMock([
+        { ref: minCoordRef, data: minCoord },
+        { ref: maxCoordRef, data: maxCoord },
       ]);
-      var xObjectDict = new Dict(xref);
-      xObjectDict.set('BBox', [minCoord, maxCoord, minCoordRef, maxCoordRef]);
+      const xObjectDict = new Dict(xref);
+      xObjectDict.set("BBox", [minCoord, maxCoord, minCoordRef, maxCoordRef]);
 
-      expect(xObjectDict.get('BBox')).toEqual(
-        [minCoord, maxCoord, minCoordRef, maxCoordRef]);
-      expect(xObjectDict.getArray('BBox')).toEqual(
-        [minCoord, maxCoord, minCoord, maxCoord]);
+      expect(xObjectDict.get("BBox")).toEqual([
+        minCoord,
+        maxCoord,
+        minCoordRef,
+        maxCoordRef,
+      ]);
+      expect(xObjectDict.getArray("BBox")).toEqual([
+        minCoord,
+        maxCoord,
+        minCoord,
+        maxCoord,
+      ]);
     });
 
-    it('should get all key names', function () {
-      var expectedKeys = ['FontFile', 'FontFile2', 'FontFile3'];
-      var keys = dictWithManyKeys.getKeys();
+    it("should get all key names", function () {
+      const expectedKeys = ["FontFile", "FontFile2"];
+      const keys = [...dictWithManyKeys.getKeys()];
 
       expect(keys.sort()).toEqual(expectedKeys);
     });
 
-    it('should create only one object for Dict.empty', function () {
-      var firstDictEmpty = Dict.empty;
-      var secondDictEmpty = Dict.empty;
+    it("should get all raw values", function () {
+      // Test direct objects:
+      const expectedRawValues1 = [testFontFile, testFontFile2];
+      const rawValues1 = [...dictWithManyKeys.getRawValues()];
+
+      expect(rawValues1.sort()).toEqual(expectedRawValues1);
+
+      // Test indirect objects:
+      const typeName = Name.get("Page");
+      const resources = new Dict(null),
+        resourcesRef = Ref.get(5, 0);
+      const contents = new StringStream("data"),
+        contentsRef = Ref.get(10, 0);
+      const xref = new XRefMock([
+        { ref: resourcesRef, data: resources },
+        { ref: contentsRef, data: contents },
+      ]);
+
+      const dict = new Dict(xref);
+      dict.set("Type", typeName);
+      dict.set("Resources", resourcesRef);
+      dict.set("Contents", contentsRef);
+
+      const expectedRawValues2 = [contentsRef, resourcesRef, typeName];
+      const rawValues2 = [...dict.getRawValues()];
+
+      expect(rawValues2.sort()).toEqual(expectedRawValues2);
+    });
+
+    it("should get all raw entries", function () {
+      const expectedRawEntries = [
+        ["FontFile", testFontFile],
+        ["FontFile2", testFontFile2],
+      ];
+      const rawEntries = Array.from(dictWithManyKeys.getRawEntries());
+      expect(rawEntries.sort()).toEqual(expectedRawEntries);
+    });
+
+    it("should create only one object for Dict.empty", function () {
+      const firstDictEmpty = Dict.empty;
+      const secondDictEmpty = Dict.empty;
 
       expect(firstDictEmpty).toBe(secondDictEmpty);
       expect(firstDictEmpty).not.toBe(emptyDict);
     });
 
-    it('should correctly merge dictionaries', function () {
-      var expectedKeys = ['FontFile', 'FontFile2', 'FontFile3', 'Size'];
+    it("should not allow to set a key in Dict.empty", function () {
+      const empty = Dict.empty;
 
-      var fontFileDict = new Dict();
-      fontFileDict.set('FontFile', 'Type1 font file');
-      var mergedDict = Dict.merge(null,
-        [dictWithManyKeys, dictWithSizeKey, fontFileDict]);
-      var mergedKeys = mergedDict.getKeys();
+      expect(function () {
+        empty.set("Type", "Qwerty");
+      }).toThrowError("Should not call `set` on the empty dictionary.");
+
+      expect(empty.size).toEqual(0);
+    });
+
+    it("should correctly merge dictionaries", function () {
+      const expectedKeys = ["FontFile", "FontFile2", "Size"];
+
+      const fontFileDict = new Dict();
+      fontFileDict.set("FontFile", "Type1 font file");
+      const mergedDict = Dict.merge({
+        xref: null,
+        dictArray: [dictWithManyKeys, dictWithSizeKey, fontFileDict],
+      });
+      const mergedKeys = [...mergedDict.getKeys()];
 
       expect(mergedKeys.sort()).toEqual(expectedKeys);
-      expect(mergedDict.get('FontFile')).toEqual(testFontFile);
+      expect(mergedDict.get("FontFile")).toEqual(testFontFile);
+    });
+
+    it("should correctly merge sub-dictionaries", function () {
+      const localFontDict = new Dict();
+      localFontDict.set("F1", "Local font one");
+
+      const globalFontDict = new Dict();
+      globalFontDict.set("F1", "Global font one");
+      globalFontDict.set("F2", "Global font two");
+      globalFontDict.set("F3", "Global font three");
+
+      const localDict = new Dict();
+      localDict.set("Font", localFontDict);
+
+      const globalDict = new Dict();
+      globalDict.set("Font", globalFontDict);
+
+      const mergedDict = Dict.merge({
+        xref: null,
+        dictArray: [localDict, globalDict],
+      });
+      const mergedSubDict = Dict.merge({
+        xref: null,
+        dictArray: [localDict, globalDict],
+        mergeSubDicts: true,
+      });
+
+      const mergedFontDict = mergedDict.get("Font");
+      const mergedSubFontDict = mergedSubDict.get("Font");
+
+      expect(mergedFontDict).toBeInstanceOf(Dict);
+      expect(mergedSubFontDict).toBeInstanceOf(Dict);
+
+      const mergedFontDictKeys = [...mergedFontDict.getKeys()];
+      const mergedSubFontDictKeys = [...mergedSubFontDict.getKeys()];
+
+      expect(mergedFontDictKeys).toEqual(["F1"]);
+      expect(mergedSubFontDictKeys).toEqual(["F1", "F2", "F3"]);
+
+      const mergedFontDictValues = [...mergedFontDict.getRawValues()];
+      const mergedSubFontDictValues = [...mergedSubFontDict.getRawValues()];
+
+      expect(mergedFontDictValues).toEqual(["Local font one"]);
+      expect(mergedSubFontDictValues).toEqual([
+        "Local font one",
+        "Global font two",
+        "Global font three",
+      ]);
+    });
+
+    it("should set the values if they're as expected", function () {
+      const dict = new Dict();
+      dict.set("key", "value");
+
+      dict.setIfNotExists("key", "new value");
+      expect(dict.get("key")).toEqual("value");
+
+      dict.setIfNotExists("key1", "value");
+      expect(dict.get("key1")).toEqual("value");
+
+      dict.setIfNumber("a", 123);
+      expect(dict.get("a")).toEqual(123);
+
+      dict.setIfNumber("b", "not a number");
+      expect(dict.has("b")).toBeFalse();
+
+      dict.setIfArray("c", [1, 2, 3]);
+      expect(dict.get("c")).toEqual([1, 2, 3]);
+
+      dict.setIfArray("d", new Uint8Array([4, 5, 6]));
+      expect(dict.get("d")).toEqual(new Uint8Array([4, 5, 6]));
+
+      dict.setIfArray("e", "not an array");
+      expect(dict.has("e")).toBeFalse();
+
+      dict.setIfDefined("f", "defined");
+      expect(dict.get("f")).toEqual("defined");
+
+      dict.setIfDefined("g", undefined);
+      expect(dict.has("g")).toBeFalse();
+
+      dict.setIfDefined("h", null);
+      expect(dict.has("h")).toBeFalse();
+
+      dict.setIfName("i", Name.get("name"));
+      expect(dict.get("i")).toEqual(Name.get("name"));
+
+      dict.setIfName("j", "name");
+      expect(dict.get("j")).toEqual(Name.get("name"));
+
+      dict.setIfName("k", 1234);
+      expect(dict.has("k")).toBeFalse();
+
+      dict.setIfDict("l", new Dict());
+      expect(dict.get("l")).toEqual(new Dict());
+
+      dict.setIfDict("m", "not a dict");
+      expect(dict.has("m")).toBeFalse();
     });
   });
 
-  describe('Ref', function() {
-    it('should retain the stored values', function() {
-      var storedNum = 4;
-      var storedGen = 2;
-      var ref = new Ref(storedNum, storedGen);
+  describe("Ref", function () {
+    it("should get a string representation", function () {
+      const nonZeroRef = Ref.get(4, 2);
+      expect(nonZeroRef.toString()).toEqual("4R2");
+
+      // If the generation number is 0, a shorter representation is used.
+      const zeroRef = Ref.get(4, 0);
+      expect(zeroRef.toString()).toEqual("4R");
+    });
+
+    it("should retain the stored values", function () {
+      const storedNum = 4;
+      const storedGen = 2;
+      const ref = Ref.get(storedNum, storedGen);
       expect(ref.num).toEqual(storedNum);
       expect(ref.gen).toEqual(storedGen);
     });
-  });
 
-  describe('RefSet', function() {
-    it('should have a stored value', function() {
-      var ref = new Ref(4, 2);
-      var refset = new RefSet();
-      refset.put(ref);
-      expect(refset.has(ref)).toBeTruthy();
-    });
-    it('should not have an unknown value', function() {
-      var ref = new Ref(4, 2);
-      var refset = new RefSet();
-      expect(refset.has(ref)).toBeFalsy();
+    it("should create only one object for a reference and cache it", function () {
+      const firstRef = Ref.get(4, 2);
+      const secondRef = Ref.get(4, 2);
+      const firstOtherRef = Ref.get(5, 2);
+      const secondOtherRef = Ref.get(5, 2);
 
-      refset.put(ref);
-      var anotherRef = new Ref(2, 4);
-      expect(refset.has(anotherRef)).toBeFalsy();
-    });
-  });
-
-  describe('isName', function () {
-    it('handles non-names', function () {
-      var nonName = {};
-      expect(isName(nonName)).toEqual(false);
+      expect(firstRef).toBe(secondRef);
+      expect(firstOtherRef).toBe(secondOtherRef);
+      expect(firstRef).not.toBe(firstOtherRef);
     });
 
-    it('handles names', function () {
-      var name = Name.get('Font');
-      expect(isName(name)).toEqual(true);
+    it("should create reference from string representation", function () {
+      expect(Ref.fromString("4R")).toBe(Ref.get(4, 0));
+      expect(Ref.fromString("4R2")).toBe(Ref.get(4, 2));
+      expect(Ref.fromString("4R8")).toBe(Ref.get(4, 8));
+      // Purposely test the same string again, to ensure that the fast-path
+      // for an already cached `Ref` instance is fully covered by tests.
+      expect(Ref.fromString("4R8")).toBe(Ref.get(4, 8));
+
+      expect(Ref.fromString("200R")).toBe(Ref.get(200, 0));
+      expect(Ref.fromString("200R10")).toBe(Ref.get(200, 10));
     });
 
-    it('handles names with name check', function () {
-      var name = Name.get('Font');
-      expect(isName(name, 'Font')).toEqual(true);
-      expect(isName(name, 'Subtype')).toEqual(false);
-    });
-  });
-
-  describe('isCmd', function () {
-    it('handles non-commands', function () {
-      var nonCmd = {};
-      expect(isCmd(nonCmd)).toEqual(false);
-    });
-
-    it('handles commands', function () {
-      var cmd = Cmd.get('BT');
-      expect(isCmd(cmd)).toEqual(true);
-    });
-
-    it('handles commands with cmd check', function () {
-      var cmd = Cmd.get('BT');
-      expect(isCmd(cmd, 'BT')).toEqual(true);
-      expect(isCmd(cmd, 'ET')).toEqual(false);
+    it("should not create reference from invalid string representation", function () {
+      for (const str of [
+        "",
+        "4",
+        "4R0",
+        "R2",
+        "0R2",
+        "04R08",
+        "fourRtwo",
+        "abc",
+      ]) {
+        expect(Ref.fromString(str)).toBeNull();
+      }
     });
   });
 
-  describe('isDict', function() {
-    it('handles non-dictionaries', function () {
-      var nonDict = {};
-      expect(isDict(nonDict)).toEqual(false);
+  describe("RefSet", function () {
+    const ref1 = Ref.get(4, 2),
+      ref2 = Ref.get(5, 2);
+    let refSet;
+
+    beforeEach(function () {
+      refSet = new RefSet();
     });
 
-    it('handles empty dictionaries with type check', function() {
-      var dict = Dict.empty;
-      expect(isDict(dict)).toEqual(true);
-      expect(isDict(dict, 'Page')).toEqual(false);
+    afterEach(function () {
+      refSet = null;
     });
 
-    it('handles dictionaries with type check', function() {
-      var dict = new Dict();
-      dict.set('Type', Name.get('Page'));
-      expect(isDict(dict, 'Page')).toEqual(true);
-      expect(isDict(dict, 'Contents')).toEqual(false);
+    it("should not set an invalid value", function () {
+      expect(function () {
+        refSet.put(10);
+      }).toThrowError('RefSet: Invalid "ref" value in put.');
+    });
+
+    it("should have a stored value", function () {
+      refSet.put(ref1);
+      expect(refSet.has(ref1)).toBeTrue();
+
+      refSet.put("5R2");
+      expect(refSet.has(ref2)).toBeTrue();
+    });
+
+    it("should not have an unknown value", function () {
+      expect(refSet.has(ref1)).toBeFalse();
+      refSet.put(ref1);
+      expect(refSet.has(ref2)).toBeFalse();
+    });
+
+    it("should not check for an invalid value", function () {
+      expect(function () {
+        refSet.has(10);
+      }).toThrowError('RefSet: Invalid "ref" value in has.');
+    });
+
+    it("should support iteration", function () {
+      refSet.put(ref1);
+      refSet.put(ref2);
+      expect([...refSet]).toEqual([ref1.toString(), ref2.toString()]);
+    });
+
+    it("should support a parent RefSet", function () {
+      const parent = new RefSet();
+      parent.put(ref1);
+      parent.put(ref2);
+
+      const child = new RefSet(parent);
+      expect([...child]).toEqual([ref1.toString(), ref2.toString()]);
+    });
+
+    it("should reject an invalid parent RefSet", function () {
+      const parent = new Set();
+      parent.add(ref1);
+      parent.add(ref2);
+
+      expect(function () {
+        // eslint-disable-next-line no-new
+        new RefSet(parent);
+      }).toThrowError('RefSet: Invalid "parent" value.');
     });
   });
 
-  describe('isRef', function () {
-    it('handles non-refs', function () {
-      var nonRef = {};
-      expect(isRef(nonRef)).toEqual(false);
+  describe("RefMap", function () {
+    const ref1 = Ref.get(4, 2),
+      ref2 = Ref.get(5, 2),
+      obj1 = Name.get("foo"),
+      obj2 = Name.get("bar");
+    let cache;
+
+    beforeEach(function () {
+      cache = new RefMap();
     });
 
-    it('handles refs', function () {
-      var ref = new Ref(1, 0);
-      expect(isRef(ref)).toEqual(true);
+    afterEach(function () {
+      cache = null;
+    });
+
+    it("should put, have and get a value", function () {
+      cache.put(ref1, obj1);
+      expect(cache.has(ref1)).toBeTrue();
+      expect(cache.has(ref2)).toBeFalse();
+      expect(cache.get(ref1)).toBe(obj1);
+    });
+
+    it("should put, have and get a value by alias", function () {
+      cache.put(ref1, obj1);
+      cache.putAlias(ref2, ref1);
+      expect(cache.has(ref1)).toBeTrue();
+      expect(cache.has(ref2)).toBeTrue();
+      expect(cache.get(ref1)).toBe(obj1);
+      expect(cache.get(ref2)).toBe(obj1);
+    });
+
+    it("should remove a value", function () {
+      cache.put(ref1, obj1);
+      cache.put(ref2, obj2);
+      cache.remove(ref1);
+      expect(cache.has(ref1)).toBeFalse();
+      expect(cache.get(ref2)).toBe(obj2);
+    });
+
+    it("should report the size of the cache", function () {
+      cache.put(ref1, obj1);
+      expect(cache.size).toEqual(1);
+      cache.put(ref2, obj2);
+      expect(cache.size).toEqual(2);
+    });
+
+    it("should clear the cache", function () {
+      cache.put(ref1, obj1);
+      expect(cache.size).toEqual(1);
+      cache.clear();
+      expect(cache.size).toEqual(0);
+    });
+
+    it("should support iteration", function () {
+      cache.put(ref1, obj1);
+      cache.put(ref2, obj2);
+      expect([...cache]).toEqual([obj1, obj2]);
+    });
+
+    it("should support iteration over key-value pairs", function () {
+      cache.put(ref1, obj1);
+      cache.put(ref2, obj2);
+      expect([...cache.items()]).toEqual([
+        [ref1, obj1],
+        [ref2, obj2],
+      ]);
+    });
+
+    it("should support iteration over keys", function () {
+      cache.put(ref1, obj1);
+      cache.put(ref2, obj2);
+      expect([...cache.keys()]).toEqual([ref1, ref2]);
+    });
+
+    it("should handle getOrPutComputed correctly", function () {
+      expect(cache.getOrPutComputed(ref1, () => obj1)).toEqual(obj1);
+      // Trying to set it again should be ignored.
+      expect(cache.getOrPutComputed(ref1, () => obj2)).toEqual(obj1);
     });
   });
 
-  describe('isRefsEqual', function () {
-    it('should handle different Refs pointing to the same object', function () {
-      var ref1 = new Ref(1, 0);
-      var ref2 = new Ref(1, 0);
-      expect(isRefsEqual(ref1, ref2)).toEqual(true);
+  describe("isName", function () {
+    /* eslint-disable no-restricted-syntax */
+
+    it("handles non-names", function () {
+      const nonName = {};
+      expect(isName(nonName)).toBeFalse();
     });
 
-    it('should handle Refs pointing to different objects', function () {
-      var ref1 = new Ref(1, 0);
-      var ref2 = new Ref(2, 0);
-      expect(isRefsEqual(ref1, ref2)).toEqual(false);
+    it("handles names", function () {
+      const name = Name.get("Font");
+      expect(isName(name)).toBeTrue();
+    });
+
+    it("handles names with name check", function () {
+      const name = Name.get("Font");
+      expect(isName(name, "Font")).toBeTrue();
+      expect(isName(name, "Subtype")).toBeFalse();
+    });
+
+    it("handles *empty* names, with name check", function () {
+      const emptyName = Name.get("");
+
+      expect(isName(emptyName)).toBeTrue();
+      expect(isName(emptyName, "")).toBeTrue();
+      expect(isName(emptyName, "string")).toBeFalse();
+    });
+
+    /* eslint-enable no-restricted-syntax */
+  });
+
+  describe("isCmd", function () {
+    /* eslint-disable no-restricted-syntax */
+
+    it("handles non-commands", function () {
+      const nonCmd = {};
+      expect(isCmd(nonCmd)).toBeFalse();
+    });
+
+    it("handles commands", function () {
+      const cmd = Cmd.get("BT");
+      expect(isCmd(cmd)).toBeTrue();
+    });
+
+    it("handles commands with cmd check", function () {
+      const cmd = Cmd.get("BT");
+      expect(isCmd(cmd, "BT")).toBeTrue();
+      expect(isCmd(cmd, "ET")).toBeFalse();
+    });
+
+    /* eslint-enable no-restricted-syntax */
+  });
+
+  describe("isDict", function () {
+    /* eslint-disable no-restricted-syntax */
+
+    it("handles non-dictionaries", function () {
+      const nonDict = {};
+      expect(isDict(nonDict)).toBeFalse();
+    });
+
+    it("handles empty dictionaries with type check", function () {
+      const dict = Dict.empty;
+      expect(isDict(dict)).toBeTrue();
+      expect(isDict(dict, "Page")).toBeFalse();
+    });
+
+    it("handles dictionaries with type check", function () {
+      const dict = new Dict();
+      dict.set("Type", Name.get("Page"));
+      expect(isDict(dict, "Page")).toBeTrue();
+      expect(isDict(dict, "Contents")).toBeFalse();
+    });
+
+    /* eslint-enable no-restricted-syntax */
+  });
+
+  describe("isRefsEqual", function () {
+    it("should handle Refs pointing to the same object", function () {
+      const ref1 = Ref.get(1, 0);
+      const ref2 = Ref.get(1, 0);
+      expect(isRefsEqual(ref1, ref2)).toBeTrue();
+    });
+
+    it("should handle Refs pointing to different objects", function () {
+      const ref1 = Ref.get(1, 0);
+      const ref2 = Ref.get(2, 0);
+      expect(isRefsEqual(ref1, ref2)).toBeFalse();
     });
   });
 });

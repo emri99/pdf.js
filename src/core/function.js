@@ -13,38 +13,79 @@
  * limitations under the License.
  */
 
-import {
-  FormatError, info, isBool, isEvalSupported, shadow, unreachable
-} from '../shared/util';
-import { isDict, isStream } from './primitives';
-import { PostScriptLexer, PostScriptParser } from './ps_parser';
+import { Dict, Ref } from "./primitives.js";
+import { FormatError, info, shadow, warn } from "../shared/util.js";
+import { BaseStream } from "./base_stream.js";
+import { buildPostScriptJsFunction } from "./postscript/js_evaluator.js";
+import { buildPostScriptWasmFunction } from "./postscript/wasm_compiler.js";
+import { isNumberArray } from "./core_utils.js";
+import { LocalFunctionCache } from "./image_utils.js";
+import { MathClamp } from "../shared/math_clamp.js";
 
-let IsEvalSupportedCached = {
-  get value() {
-    return shadow(this, 'value', isEvalSupported());
-  },
+const FunctionType = {
+  SAMPLED: 0,
+  EXPONENTIAL_INTERPOLATION: 2,
+  STITCHING: 3,
+  POSTSCRIPT_CALCULATOR: 4,
 };
 
 class PDFFunctionFactory {
-  constructor({ xref, isEvalSupported = true, }) {
+  static #useWasm = true;
+
+  static setOptions({ useWasm }) {
+    this.#useWasm = useWasm;
+  }
+
+  constructor({ xref }) {
     this.xref = xref;
-    this.isEvalSupported = isEvalSupported !== false;
   }
 
-  create(fn) {
-    return PDFFunction.parse({
-      xref: this.xref,
-      isEvalSupported: this.isEvalSupported,
-      fn,
-    });
+  get useWasm() {
+    return PDFFunctionFactory.#useWasm;
   }
 
-  createFromArray(fnObj) {
-    return PDFFunction.parseArray({
-      xref: this.xref,
-      isEvalSupported: this.isEvalSupported,
-      fnObj,
-    });
+  create(fn, parseArray = false) {
+    let fnRef, parsedFn;
+
+    // Check if the Function is cached first, to avoid re-parsing it.
+    if (fn instanceof Ref) {
+      fnRef = fn;
+    } else if (fn instanceof Dict) {
+      fnRef = fn.objId;
+    } else if (fn instanceof BaseStream) {
+      fnRef = fn.dict?.objId;
+    }
+    if (fnRef) {
+      const cachedFn = this._localFunctionCache.getByRef(fnRef);
+      if (cachedFn) {
+        return cachedFn;
+      }
+    }
+
+    const fnObj = this.xref.fetchIfRef(fn);
+    if (Array.isArray(fnObj)) {
+      if (!parseArray) {
+        throw new Error(
+          'PDFFunctionFactory.create - expected "parseArray" argument.'
+        );
+      }
+      parsedFn = PDFFunction.parseArray(this, fnObj);
+    } else {
+      parsedFn = PDFFunction.parse(this, fnObj);
+    }
+
+    // Attempt to cache the parsed Function, by reference.
+    if (fnRef) {
+      this._localFunctionCache.set(/* name = */ null, fnRef, parsedFn);
+    }
+    return parsedFn;
+  }
+
+  /**
+   * @private
+   */
+  get _localFunctionCache() {
+    return shadow(this, "_localFunctionCache", new LocalFunctionCache());
   }
 }
 
@@ -52,1128 +93,375 @@ function toNumberArray(arr) {
   if (!Array.isArray(arr)) {
     return null;
   }
-  const length = arr.length;
-  for (let i = 0; i < length; i++) {
-    if (typeof arr[i] !== 'number') {
-      // Non-number is found -- convert all items to numbers.
-      const result = new Array(length);
-      for (let i = 0; i < length; i++) {
-        result[i] = +arr[i];
-      }
-      return result;
-    }
+  if (!isNumberArray(arr, null)) {
+    // Non-number is found -- convert all items to numbers.
+    return arr.map(x => +x);
   }
   return arr;
 }
 
-var PDFFunction = (function PDFFunctionClosure() {
-  const CONSTRUCT_SAMPLED = 0;
-  const CONSTRUCT_INTERPOLATED = 2;
-  const CONSTRUCT_STICHED = 3;
-  const CONSTRUCT_POSTSCRIPT = 4;
+// Expose input/output counts for validation by callers.
+function setArity(fn, numInputs, numOutputs) {
+  fn.numInputs = numInputs;
+  fn.numOutputs = numOutputs;
+  return fn;
+}
 
-  return {
-    getSampleArray(size, outputSize, bps, stream) {
-      var i, ii;
-      var length = 1;
-      for (i = 0, ii = size.length; i < ii; i++) {
-        length *= size[i];
+// ISO 32000-1:2008, 7.10.2.
+function interpolate(x, xmin, xmax, ymin, ymax) {
+  // A degenerate `Domain` entry, e.g. `[0 0]`, occurs in real-world PDFs.
+  return xmin === xmax
+    ? ymin
+    : ymin + (x - xmin) * ((ymax - ymin) / (xmax - xmin));
+}
+
+class PDFFunction {
+  // Limit multilinear interpolation's 2^m vertex growth for m inputs.
+  // Above this limit, simplex interpolation uses at most m + 1 vertices.
+  static MAX_MULTILINEAR_INPUTS = 8;
+
+  static getSampleArray(size, outputSize, bps, stream) {
+    let length = outputSize;
+    for (const s of size) {
+      length *= s;
+    }
+
+    const array = new Array(length);
+    let codeSize = 0;
+    let codeBuf = 0;
+    // 32 is a valid bps so shifting won't work
+    const sampleMul = 1.0 / (2.0 ** bps - 1);
+
+    const strBytes = stream.getBytes((length * bps + 7) / 8);
+    let strIdx = 0;
+    for (let i = 0; i < length; i++) {
+      while (codeSize < bps) {
+        codeBuf <<= 8;
+        codeBuf |= strBytes[strIdx++];
+        codeSize += 8;
       }
-      length *= outputSize;
+      codeSize -= bps;
+      // Use an unsigned shift, since `codeBuf` can have the high bit set for
+      // 32 bits-per-sample data.
+      array[i] = (codeBuf >>> codeSize) * sampleMul;
+      codeBuf &= (1 << codeSize) - 1;
+    }
+    return array;
+  }
 
-      var array = new Array(length);
-      var codeSize = 0;
-      var codeBuf = 0;
-      // 32 is a valid bps so shifting won't work
-      var sampleMul = 1.0 / (Math.pow(2.0, bps) - 1);
+  static parse(factory, fn) {
+    const dict = fn.dict || fn;
+    const typeNum = dict.get("FunctionType");
 
-      var strBytes = stream.getBytes((length * bps + 7) / 8);
-      var strIdx = 0;
-      for (i = 0; i < length; i++) {
-        while (codeSize < bps) {
-          codeBuf <<= 8;
-          codeBuf |= strBytes[strIdx++];
-          codeSize += 8;
-        }
-        codeSize -= bps;
-        array[i] = (codeBuf >> codeSize) * sampleMul;
-        codeBuf &= (1 << codeSize) - 1;
-      }
-      return array;
-    },
+    switch (typeNum) {
+      case FunctionType.SAMPLED:
+        return this.constructSampled(factory, fn, dict);
+      case FunctionType.EXPONENTIAL_INTERPOLATION:
+        return this.constructInterpolated(factory, dict);
+      case FunctionType.STITCHING:
+        return this.constructStitched(factory, dict);
+      case FunctionType.POSTSCRIPT_CALCULATOR:
+        return this.constructPostScript(factory, fn, dict);
+    }
+    throw new FormatError(`Unknown function type: ${typeNum}`);
+  }
 
-    getIR({ xref, isEvalSupported, fn, }) {
-      var dict = fn.dict;
-      if (!dict) {
-        dict = fn;
-      }
+  static parseArray(factory, fnObj) {
+    const { xref } = factory;
 
-      var types = [this.constructSampled,
-                   null,
-                   this.constructInterpolated,
-                   this.constructStiched,
-                   this.constructPostScript];
-
-      var typeNum = dict.get('FunctionType');
-      var typeFn = types[typeNum];
-      if (!typeFn) {
-        throw new FormatError('Unknown type of function');
-      }
-
-      return typeFn.call(this, { xref, isEvalSupported, fn, dict, });
-    },
-
-    fromIR({ xref, isEvalSupported, IR, }) {
-      var type = IR[0];
-      switch (type) {
-        case CONSTRUCT_SAMPLED:
-          return this.constructSampledFromIR({ xref, isEvalSupported, IR, });
-        case CONSTRUCT_INTERPOLATED:
-          return this.constructInterpolatedFromIR({ xref, isEvalSupported,
-                                                    IR, });
-        case CONSTRUCT_STICHED:
-          return this.constructStichedFromIR({ xref, isEvalSupported, IR, });
-        // case CONSTRUCT_POSTSCRIPT:
-        default:
-          return this.constructPostScriptFromIR({ xref, isEvalSupported, IR, });
-      }
-    },
-
-    parse({ xref, isEvalSupported, fn, }) {
-      let IR = this.getIR({ xref, isEvalSupported, fn, });
-      return this.fromIR({ xref, isEvalSupported, IR, });
-    },
-
-    parseArray({ xref, isEvalSupported, fnObj, }) {
-      if (!Array.isArray(fnObj)) {
-        // not an array -- parsing as regular function
-        return this.parse({ xref, isEvalSupported, fn: fnObj, });
-      }
-
-      var fnArray = [];
-      for (var j = 0, jj = fnObj.length; j < jj; j++) {
-        fnArray.push(this.parse({ xref, isEvalSupported,
-                                  fn: xref.fetchIfRef(fnObj[j]), }));
-      }
-      return function(src, srcOffset, dest, destOffset) {
-        for (var i = 0, ii = fnArray.length; i < ii; i++) {
+    const fnArray = [];
+    for (const fn of fnObj) {
+      fnArray.push(this.parse(factory, xref.fetchIfRef(fn)));
+    }
+    if (fnArray.length === 1) {
+      return fnArray[0];
+    }
+    // Combine single-output functions with matching input counts.
+    const numInputs = fnArray[0]?.numInputs ?? 0;
+    if (fnArray.some(fn => fn.numInputs !== numInputs || fn.numOutputs !== 1)) {
+      throw new FormatError("Invalid array of functions.");
+    }
+    return setArity(
+      function (src, srcOffset, dest, destOffset) {
+        for (let i = 0, ii = fnArray.length; i < ii; i++) {
           fnArray[i](src, srcOffset, dest, destOffset + i);
         }
-      };
-    },
+      },
+      numInputs,
+      fnArray.length
+    );
+  }
 
-    constructSampled({ xref, isEvalSupported, fn, dict, }) {
-      function toMultiArray(arr) {
-        var inputLength = arr.length;
-        var out = [];
-        var index = 0;
-        for (var i = 0; i < inputLength; i += 2) {
-          out[index] = [arr[i], arr[i + 1]];
-          ++index;
+  static constructSampled(factory, fn, dict) {
+    const domain = toNumberArray(dict.getArray("Domain"));
+    const range = toNumberArray(dict.getArray("Range"));
+
+    if (!domain || !range) {
+      throw new FormatError("No domain or range");
+    }
+
+    const inputSize = domain.length / 2;
+    const outputSize = range.length / 2;
+
+    const size = toNumberArray(dict.getArray("Size"));
+    const bps = dict.get("BitsPerSample");
+    const order = dict.get("Order") || 1;
+    if (order !== 1) {
+      // No description how cubic spline interpolation works in PDF32000:2008
+      // As in poppler, ignoring order, linear interpolation may work as good
+      info("No support for cubic spline interpolation: " + order);
+    }
+
+    let encode = toNumberArray(dict.getArray("Encode"));
+    if (!encode) {
+      encode = [];
+      for (let i = 0; i < inputSize; ++i) {
+        encode.push(0, size[i] - 1);
+      }
+    }
+
+    const decode = toNumberArray(dict.getArray("Decode")) || range;
+
+    const samples = this.getSampleArray(size, outputSize, bps, fn);
+
+    const useSimplex = inputSize > PDFFunction.MAX_MULTILINEAR_INPUTS;
+    // Sample strides and weights for axes needing interpolation.
+    const steps = new Float64Array(inputSize);
+    const weights0 = new Float64Array(inputSize);
+    const weights1 = new Float64Array(inputSize);
+    // Active axis indices, sorted by decreasing fractional part.
+    const sorted = useSimplex ? new Uint32Array(inputSize) : null;
+    // Sample offsets and weights, reused across calls.
+    const maxVertices = useSimplex ? inputSize + 1 : 1 << inputSize;
+    const vertices = new Uint32Array(maxVertices);
+    const vertexWeights = new Float64Array(maxVertices);
+
+    function constructSampledFn(src, srcOffset, dest, destOffset) {
+      // ISO 32000-1:2008, 7.10.2.
+      let base = 0,
+        k = outputSize,
+        numActive = 0;
+      // Map inputs to sample coordinates.
+      for (let i = 0; i < inputSize; ++i) {
+        // x_i' = min(max(x_i, Domain_2i), Domain_2i+1)
+        const domain_2i = domain[2 * i];
+        const domain_2i_1 = domain[2 * i + 1];
+        const xi = MathClamp(src[srcOffset + i], domain_2i, domain_2i_1);
+
+        // e_i = Interpolate(x_i', Domain_2i, Domain_2i+1,
+        //                   Encode_2i, Encode_2i+1)
+        let e = interpolate(
+          xi,
+          domain_2i,
+          domain_2i_1,
+          encode[2 * i],
+          encode[2 * i + 1]
+        );
+
+        // e_i' = min(max(e_i, 0), Size_i - 1)
+        const size_i = size[i];
+        e = MathClamp(e, 0, size_i - 1);
+
+        const e0 = Math.floor(e); // e1 = e0 + 1
+        base += e0 * k;
+        // Integer sample coordinates need no interpolation along this axis.
+        if (e !== e0) {
+          steps[numActive] = k;
+          weights0[numActive] = e0 + 1 - e; // (e1 - e) / (e1 - e0)
+          weights1[numActive] = e - e0; // (e - e0) / (e1 - e0)
+          numActive++;
         }
-        return out;
-      }
-      var domain = toNumberArray(dict.getArray('Domain'));
-      var range = toNumberArray(dict.getArray('Range'));
-
-      if (!domain || !range) {
-        throw new FormatError('No domain or range');
+        k *= size_i;
       }
 
-      var inputSize = domain.length / 2;
-      var outputSize = range.length / 2;
-
-      domain = toMultiArray(domain);
-      range = toMultiArray(range);
-
-      var size = toNumberArray(dict.getArray('Size'));
-      var bps = dict.get('BitsPerSample');
-      var order = dict.get('Order') || 1;
-      if (order !== 1) {
-        // No description how cubic spline interpolation works in PDF32000:2008
-        // As in poppler, ignoring order, linear interpolation may work as good
-        info('No support for cubic spline interpolation: ' + order);
-      }
-
-      var encode = toNumberArray(dict.getArray('Encode'));
-      if (!encode) {
-        encode = [];
-        for (var i = 0; i < inputSize; ++i) {
-          encode.push([0, size[i] - 1]);
-        }
-      } else {
-        encode = toMultiArray(encode);
-      }
-
-      var decode = toNumberArray(dict.getArray('Decode'));
-      if (!decode) {
-        decode = range;
-      } else {
-        decode = toMultiArray(decode);
-      }
-
-      var samples = this.getSampleArray(size, outputSize, bps, fn);
-
-      return [
-        CONSTRUCT_SAMPLED, inputSize, domain, encode, decode, samples, size,
-        outputSize, Math.pow(2, bps) - 1, range
-      ];
-    },
-
-    constructSampledFromIR({ xref, isEvalSupported, IR, }) {
-      // See chapter 3, page 109 of the PDF reference
-      function interpolate(x, xmin, xmax, ymin, ymax) {
-        return ymin + ((x - xmin) * ((ymax - ymin) / (xmax - xmin)));
-      }
-
-      return function constructSampledFromIRResult(src, srcOffset,
-                                                   dest, destOffset) {
-        // See chapter 3, page 110 of the PDF reference.
-        var m = IR[1];
-        var domain = IR[2];
-        var encode = IR[3];
-        var decode = IR[4];
-        var samples = IR[5];
-        var size = IR[6];
-        var n = IR[7];
-        // var mask = IR[8];
-        var range = IR[9];
-
-        // Building the cube vertices: its part and sample index
-        // http://rjwagner49.com/Mathematics/Interpolation.pdf
-        var cubeVertices = 1 << m;
-        var cubeN = new Float64Array(cubeVertices);
-        var cubeVertex = new Uint32Array(cubeVertices);
-        var i, j;
-        for (j = 0; j < cubeVertices; j++) {
-          cubeN[j] = 1;
-        }
-
-        var k = n, pos = 1;
-        // Map x_i to y_j for 0 <= i < m using the sampled function.
-        for (i = 0; i < m; ++i) {
-          // x_i' = min(max(x_i, Domain_2i), Domain_2i+1)
-          var domain_2i = domain[i][0];
-          var domain_2i_1 = domain[i][1];
-          var xi = Math.min(Math.max(src[srcOffset + i], domain_2i),
-                            domain_2i_1);
-
-          // e_i = Interpolate(x_i', Domain_2i, Domain_2i+1,
-          //                   Encode_2i, Encode_2i+1)
-          var e = interpolate(xi, domain_2i, domain_2i_1,
-                              encode[i][0], encode[i][1]);
-
-          // e_i' = min(max(e_i, 0), Size_i - 1)
-          var size_i = size[i];
-          e = Math.min(Math.max(e, 0), size_i - 1);
-
-          // Adjusting the cube: N and vertex sample index
-          var e0 = e < size_i - 1 ? Math.floor(e) : e - 1; // e1 = e0 + 1;
-          var n0 = e0 + 1 - e; // (e1 - e) / (e1 - e0);
-          var n1 = e - e0; // (e - e0) / (e1 - e0);
-          var offset0 = e0 * k;
-          var offset1 = offset0 + k; // e1 * k
-          for (j = 0; j < cubeVertices; j++) {
-            if (j & pos) {
-              cubeN[j] *= n1;
-              cubeVertex[j] += offset1;
-            } else {
-              cubeN[j] *= n0;
-              cubeVertex[j] += offset0;
-            }
+      vertices[0] = base;
+      vertexWeights[0] = 1;
+      let numVertices = 1;
+      if (!useSimplex) {
+        // Build the 2^numActive vertices and their product weights.
+        // https://rjwagner49.com/Mathematics/Interpolation.pdf
+        for (let i = 0; i < numActive; i++) {
+          const step = steps[i],
+            w0 = weights0[i],
+            w1 = weights1[i];
+          for (let j = 0; j < numVertices; j++) {
+            vertices[numVertices + j] = vertices[j] + step;
+            vertexWeights[numVertices + j] = vertexWeights[j] * w1;
+            vertexWeights[j] *= w0;
           }
-
-          k *= size_i;
-          pos <<= 1;
+          numVertices <<= 1;
         }
-
-        for (j = 0; j < n; ++j) {
-          // Sum all cube vertices' samples portions
-          var rj = 0;
-          for (i = 0; i < cubeVertices; i++) {
-            rj += samples[cubeVertex[i] + j] * cubeN[i];
+      } else if (numActive > 0) {
+        // Sort axes by decreasing fraction to find the containing simplex.
+        // Results can differ from multilinear interpolation.
+        for (let i = 0; i < numActive; i++) {
+          const w1 = weights1[i];
+          let j = i;
+          for (; j > 0 && weights1[sorted[j - 1]] < w1; j--) {
+            sorted[j] = sorted[j - 1];
           }
-
-          // r_j' = Interpolate(r_j, 0, 2^BitsPerSample - 1,
-          //                    Decode_2j, Decode_2j+1)
-          rj = interpolate(rj, 0, 1, decode[j][0], decode[j][1]);
-
-          // y_j = min(max(r_j, range_2j), range_2j+1)
-          dest[destOffset + j] = Math.min(Math.max(rj, range[j][0]),
-                                          range[j][1]);
+          sorted[j] = i;
         }
-      };
-    },
-
-    constructInterpolated({ xref, isEvalSupported, fn, dict, }) {
-      var c0 = toNumberArray(dict.getArray('C0')) || [0];
-      var c1 = toNumberArray(dict.getArray('C1')) || [1];
-      var n = dict.get('N');
-
-      var length = c0.length;
-      var diff = [];
-      for (var i = 0; i < length; ++i) {
-        diff.push(c1[i] - c0[i]);
+        // Use consecutive differences in [1, ...fractions, 0] as weights.
+        vertexWeights[0] = weights0[sorted[0]];
+        for (let i = 0; i < numActive; i++) {
+          const a = sorted[i];
+          vertices[i + 1] = vertices[i] + steps[a];
+          vertexWeights[i + 1] =
+            i + 1 < numActive
+              ? weights1[a] - weights1[sorted[i + 1]]
+              : weights1[a];
+        }
+        numVertices = numActive + 1;
       }
 
-      return [CONSTRUCT_INTERPOLATED, c0, diff, n];
-    },
-
-    constructInterpolatedFromIR({ xref, isEvalSupported, IR, }) {
-      var c0 = IR[1];
-      var diff = IR[2];
-      var n = IR[3];
-
-      var length = diff.length;
-
-      return function constructInterpolatedFromIRResult(src, srcOffset,
-                                                        dest, destOffset) {
-        var x = n === 1 ? src[srcOffset] : Math.pow(src[srcOffset], n);
-
-        for (var j = 0; j < length; ++j) {
-          dest[destOffset + j] = c0[j] + (x * diff[j]);
+      for (let j = 0; j < outputSize; ++j) {
+        // Weighted sum of the samples for this output.
+        let rj = 0;
+        for (let i = 0; i < numVertices; i++) {
+          rj += samples[vertices[i] + j] * vertexWeights[i];
         }
-      };
-    },
 
-    constructStiched({ xref, isEvalSupported, fn, dict, }) {
-      var domain = toNumberArray(dict.getArray('Domain'));
+        // getSampleArray already scales samples by 1 / (2^bps - 1).
+        rj = interpolate(rj, 0, 1, decode[2 * j], decode[2 * j + 1]);
 
-      if (!domain) {
-        throw new FormatError('No domain');
+        // y_j = min(max(r_j, range_2j), range_2j+1)
+        dest[destOffset + j] = MathClamp(rj, range[2 * j], range[2 * j + 1]);
+      }
+    }
+    return setArity(constructSampledFn, inputSize, outputSize);
+  }
+
+  static constructInterpolated(factory, dict) {
+    const domain = toNumberArray(dict.getArray("Domain"));
+    const c0 = toNumberArray(dict.getArray("C0")) || [0];
+    const c1 = toNumberArray(dict.getArray("C1")) || [1];
+    const n = dict.get("N");
+
+    const diff = [];
+    for (let i = 0, ii = c0.length; i < ii; ++i) {
+      diff.push(c1[i] - c0[i]);
+    }
+    const length = diff.length;
+
+    function constructInterpolatedFn(src, srcOffset, dest, destOffset) {
+      const x = n === 1 ? src[srcOffset] : src[srcOffset] ** n;
+
+      for (let j = 0; j < length; ++j) {
+        dest[destOffset + j] = c0[j] + x * diff[j];
+      }
+    }
+    return setArity(
+      constructInterpolatedFn,
+      domain ? domain.length / 2 : 1,
+      length
+    );
+  }
+
+  static constructStitched(factory, dict) {
+    const domain = toNumberArray(dict.getArray("Domain"));
+
+    if (!domain) {
+      throw new FormatError("No domain");
+    }
+
+    const inputSize = domain.length / 2;
+    if (inputSize !== 1) {
+      throw new FormatError("Bad domain for stitched function");
+    }
+    const { xref } = factory;
+
+    const fns = [];
+    for (const fn of dict.get("Functions")) {
+      fns.push(this.parse(factory, xref.fetchIfRef(fn)));
+    }
+    // Each sub-function takes one input and produces all outputs (Table 41).
+    const numOutputs = fns[0]?.numOutputs ?? 0;
+    if (
+      fns.length === 0 ||
+      fns.some(fn => fn.numInputs !== 1 || fn.numOutputs !== numOutputs)
+    ) {
+      throw new FormatError("Incompatible sub-functions for stitched function");
+    }
+
+    const bounds = toNumberArray(dict.getArray("Bounds"));
+    const encode = toNumberArray(dict.getArray("Encode"));
+    const tmpBuf = new Float32Array(1);
+
+    function constructStitchedFn(src, srcOffset, dest, destOffset) {
+      // Clamp to domain.
+      const v = MathClamp(src[srcOffset], domain[0], domain[1]);
+      // calculate which bound the value is in
+      const length = bounds.length;
+      let i;
+      for (i = 0; i < length; ++i) {
+        if (v < bounds[i]) {
+          break;
+        }
       }
 
-      var inputSize = domain.length / 2;
-      if (inputSize !== 1) {
-        throw new FormatError('Bad domain for stiched function');
-      }
+      // encode value into domain of function
+      const dmin = i > 0 ? bounds[i - 1] : domain[0];
+      const dmax = i < length ? bounds[i] : domain[1];
 
-      var fnRefs = dict.get('Functions');
-      var fns = [];
-      for (var i = 0, ii = fnRefs.length; i < ii; ++i) {
-        fns.push(this.parse({ xref, isEvalSupported,
-                              fn: xref.fetchIfRef(fnRefs[i]), }));
-      }
+      tmpBuf[0] = interpolate(
+        v,
+        dmin,
+        dmax,
+        /* rmin = */ encode[2 * i],
+        /* rmax = */ encode[2 * i + 1]
+      );
+      // call the appropriate function
+      fns[i](tmpBuf, 0, dest, destOffset);
+    }
+    return setArity(constructStitchedFn, inputSize, numOutputs);
+  }
 
-      var bounds = toNumberArray(dict.getArray('Bounds'));
-      var encode = toNumberArray(dict.getArray('Encode'));
+  static constructPostScript(factory, fn, dict) {
+    const domain = toNumberArray(dict.getArray("Domain"));
+    const range = toNumberArray(dict.getArray("Range"));
 
-      return [CONSTRUCT_STICHED, domain, bounds, encode, fns];
-    },
+    if (!domain) {
+      throw new FormatError("No domain.");
+    }
 
-    constructStichedFromIR({ xref, isEvalSupported, IR, }) {
-      var domain = IR[1];
-      var bounds = IR[2];
-      var encode = IR[3];
-      var fns = IR[4];
-      var tmpBuf = new Float32Array(1);
+    if (!range) {
+      throw new FormatError("No range.");
+    }
 
-      return function constructStichedFromIRResult(src, srcOffset,
-                                                   dest, destOffset) {
-        var clip = function constructStichedFromIRClip(v, min, max) {
-          if (v > max) {
-            v = max;
-          } else if (v < min) {
-            v = min;
-          }
-          return v;
-        };
+    const psCode = fn.getString();
+    const numInputs = domain.length / 2,
+      numOutputs = range.length / 2;
 
-        // clip to domain
-        var v = clip(src[srcOffset], domain[0], domain[1]);
-        // calculate which bound the value is in
-        for (var i = 0, ii = bounds.length; i < ii; ++i) {
-          if (v < bounds[i]) {
-            break;
-          }
-        }
-
-        // encode value into domain of function
-        var dmin = domain[0];
-        if (i > 0) {
-          dmin = bounds[i - 1];
-        }
-        var dmax = domain[1];
-        if (i < bounds.length) {
-          dmax = bounds[i];
-        }
-
-        var rmin = encode[2 * i];
-        var rmax = encode[2 * i + 1];
-
-        // Prevent the value from becoming NaN as a result
-        // of division by zero (fixes issue6113.pdf).
-        tmpBuf[0] = dmin === dmax ? rmin :
-                    rmin + (v - dmin) * (rmax - rmin) / (dmax - dmin);
-
-        // call the appropriate function
-        fns[i](tmpBuf, 0, dest, destOffset);
-      };
-    },
-
-    constructPostScript({ xref, isEvalSupported, fn, dict, }) {
-      var domain = toNumberArray(dict.getArray('Domain'));
-      var range = toNumberArray(dict.getArray('Range'));
-
-      if (!domain) {
-        throw new FormatError('No domain.');
-      }
-
-      if (!range) {
-        throw new FormatError('No range.');
-      }
-
-      var lexer = new PostScriptLexer(fn);
-      var parser = new PostScriptParser(lexer);
-      var code = parser.parse();
-
-      return [CONSTRUCT_POSTSCRIPT, domain, range, code];
-    },
-
-    constructPostScriptFromIR({ xref, isEvalSupported, IR, }) {
-      var domain = IR[1];
-      var range = IR[2];
-      var code = IR[3];
-
-      if (isEvalSupported && IsEvalSupportedCached.value) {
-        let compiled = (new PostScriptCompiler()).compile(code, domain, range);
-        if (compiled) {
-          // Compiled function consists of simple expressions such as addition,
-          // subtraction, Math.max, and also contains 'var' and 'return'
-          // statements. See the generation in the PostScriptCompiler below.
-          // eslint-disable-next-line no-new-func
-          return new Function('src', 'srcOffset', 'dest', 'destOffset',
-                              compiled);
+    try {
+      if (factory.useWasm) {
+        const wasmFn = buildPostScriptWasmFunction(psCode, domain, range);
+        if (wasmFn) {
+          return setArity(wasmFn, numInputs, numOutputs);
         }
       }
-      info('Unable to compile PS function');
+    } catch {}
 
-      var numOutputs = range.length >> 1;
-      var numInputs = domain.length >> 1;
-      var evaluator = new PostScriptEvaluator(code);
-      // Cache the values for a big speed up, the cache size is limited though
-      // since the number of possible values can be huge from a PS function.
-      var cache = Object.create(null);
-      // The MAX_CACHE_SIZE is set to ~4x the maximum number of distinct values
-      // seen in our tests.
-      var MAX_CACHE_SIZE = 2048 * 4;
-      var cache_available = MAX_CACHE_SIZE;
-      var tmpBuf = new Float32Array(numInputs);
+    warn("Failed to compile PostScript function to wasm, falling back to JS");
 
-      return function constructPostScriptFromIRResult(src, srcOffset,
-                                                      dest, destOffset) {
-        var i, value;
-        var key = '';
-        var input = tmpBuf;
-        for (i = 0; i < numInputs; i++) {
-          value = src[srcOffset + i];
-          input[i] = value;
-          key += value + '_';
-        }
-
-        var cachedValue = cache[key];
-        if (cachedValue !== undefined) {
-          dest.set(cachedValue, destOffset);
-          return;
-        }
-
-        var output = new Float32Array(numOutputs);
-        var stack = evaluator.execute(input);
-        var stackIndex = stack.length - numOutputs;
-        for (i = 0; i < numOutputs; i++) {
-          value = stack[stackIndex + i];
-          var bound = range[i * 2];
-          if (value < bound) {
-            value = bound;
-          } else {
-            bound = range[i * 2 + 1];
-            if (value > bound) {
-              value = bound;
-            }
-          }
-          output[i] = value;
-        }
-        if (cache_available > 0) {
-          cache_available--;
-          cache[key] = output;
-        }
-        dest.set(output, destOffset);
-      };
-    },
-  };
-})();
+    return setArity(
+      buildPostScriptJsFunction(psCode, domain, range),
+      numInputs,
+      numOutputs
+    );
+  }
+}
 
 function isPDFFunction(v) {
-  var fnDict;
-  if (typeof v !== 'object') {
-    return false;
-  } else if (isDict(v)) {
+  let fnDict;
+  if (v instanceof Dict) {
     fnDict = v;
-  } else if (isStream(v)) {
+  } else if (v instanceof BaseStream) {
     fnDict = v.dict;
   } else {
     return false;
   }
-  return fnDict.has('FunctionType');
+  return fnDict.has("FunctionType");
 }
 
-var PostScriptStack = (function PostScriptStackClosure() {
-  var MAX_STACK_SIZE = 100;
-  function PostScriptStack(initialStack) {
-    this.stack = !initialStack ? [] :
-                 Array.prototype.slice.call(initialStack, 0);
-  }
-
-  PostScriptStack.prototype = {
-    push: function PostScriptStack_push(value) {
-      if (this.stack.length >= MAX_STACK_SIZE) {
-        throw new Error('PostScript function stack overflow.');
-      }
-      this.stack.push(value);
-    },
-    pop: function PostScriptStack_pop() {
-      if (this.stack.length <= 0) {
-        throw new Error('PostScript function stack underflow.');
-      }
-      return this.stack.pop();
-    },
-    copy: function PostScriptStack_copy(n) {
-      if (this.stack.length + n >= MAX_STACK_SIZE) {
-        throw new Error('PostScript function stack overflow.');
-      }
-      var stack = this.stack;
-      for (var i = stack.length - n, j = n - 1; j >= 0; j--, i++) {
-        stack.push(stack[i]);
-      }
-    },
-    index: function PostScriptStack_index(n) {
-      this.push(this.stack[this.stack.length - n - 1]);
-    },
-    // rotate the last n stack elements p times
-    roll: function PostScriptStack_roll(n, p) {
-      var stack = this.stack;
-      var l = stack.length - n;
-      var r = stack.length - 1, c = l + (p - Math.floor(p / n) * n), i, j, t;
-      for (i = l, j = r; i < j; i++, j--) {
-        t = stack[i]; stack[i] = stack[j]; stack[j] = t;
-      }
-      for (i = l, j = c - 1; i < j; i++, j--) {
-        t = stack[i]; stack[i] = stack[j]; stack[j] = t;
-      }
-      for (i = c, j = r; i < j; i++, j--) {
-        t = stack[i]; stack[i] = stack[j]; stack[j] = t;
-      }
-    },
-  };
-  return PostScriptStack;
-})();
-var PostScriptEvaluator = (function PostScriptEvaluatorClosure() {
-  function PostScriptEvaluator(operators) {
-    this.operators = operators;
-  }
-  PostScriptEvaluator.prototype = {
-    execute: function PostScriptEvaluator_execute(initialStack) {
-      var stack = new PostScriptStack(initialStack);
-      var counter = 0;
-      var operators = this.operators;
-      var length = operators.length;
-      var operator, a, b;
-      while (counter < length) {
-        operator = operators[counter++];
-        if (typeof operator === 'number') {
-          // Operator is really an operand and should be pushed to the stack.
-          stack.push(operator);
-          continue;
-        }
-        switch (operator) {
-          // non standard ps operators
-          case 'jz': // jump if false
-            b = stack.pop();
-            a = stack.pop();
-            if (!a) {
-              counter = b;
-            }
-            break;
-          case 'j': // jump
-            a = stack.pop();
-            counter = a;
-            break;
-
-          // all ps operators in alphabetical order (excluding if/ifelse)
-          case 'abs':
-            a = stack.pop();
-            stack.push(Math.abs(a));
-            break;
-          case 'add':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a + b);
-            break;
-          case 'and':
-            b = stack.pop();
-            a = stack.pop();
-            if (isBool(a) && isBool(b)) {
-              stack.push(a && b);
-            } else {
-              stack.push(a & b);
-            }
-            break;
-          case 'atan':
-            a = stack.pop();
-            stack.push(Math.atan(a));
-            break;
-          case 'bitshift':
-            b = stack.pop();
-            a = stack.pop();
-            if (a > 0) {
-              stack.push(a << b);
-            } else {
-              stack.push(a >> b);
-            }
-            break;
-          case 'ceiling':
-            a = stack.pop();
-            stack.push(Math.ceil(a));
-            break;
-          case 'copy':
-            a = stack.pop();
-            stack.copy(a);
-            break;
-          case 'cos':
-            a = stack.pop();
-            stack.push(Math.cos(a));
-            break;
-          case 'cvi':
-            a = stack.pop() | 0;
-            stack.push(a);
-            break;
-          case 'cvr':
-            // noop
-            break;
-          case 'div':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a / b);
-            break;
-          case 'dup':
-            stack.copy(1);
-            break;
-          case 'eq':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a === b);
-            break;
-          case 'exch':
-            stack.roll(2, 1);
-            break;
-          case 'exp':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(Math.pow(a, b));
-            break;
-          case 'false':
-            stack.push(false);
-            break;
-          case 'floor':
-            a = stack.pop();
-            stack.push(Math.floor(a));
-            break;
-          case 'ge':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a >= b);
-            break;
-          case 'gt':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a > b);
-            break;
-          case 'idiv':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push((a / b) | 0);
-            break;
-          case 'index':
-            a = stack.pop();
-            stack.index(a);
-            break;
-          case 'le':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a <= b);
-            break;
-          case 'ln':
-            a = stack.pop();
-            stack.push(Math.log(a));
-            break;
-          case 'log':
-            a = stack.pop();
-            stack.push(Math.log(a) / Math.LN10);
-            break;
-          case 'lt':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a < b);
-            break;
-          case 'mod':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a % b);
-            break;
-          case 'mul':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a * b);
-            break;
-          case 'ne':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a !== b);
-            break;
-          case 'neg':
-            a = stack.pop();
-            stack.push(-a);
-            break;
-          case 'not':
-            a = stack.pop();
-            if (isBool(a)) {
-              stack.push(!a);
-            } else {
-              stack.push(~a);
-            }
-            break;
-          case 'or':
-            b = stack.pop();
-            a = stack.pop();
-            if (isBool(a) && isBool(b)) {
-              stack.push(a || b);
-            } else {
-              stack.push(a | b);
-            }
-            break;
-          case 'pop':
-            stack.pop();
-            break;
-          case 'roll':
-            b = stack.pop();
-            a = stack.pop();
-            stack.roll(a, b);
-            break;
-          case 'round':
-            a = stack.pop();
-            stack.push(Math.round(a));
-            break;
-          case 'sin':
-            a = stack.pop();
-            stack.push(Math.sin(a));
-            break;
-          case 'sqrt':
-            a = stack.pop();
-            stack.push(Math.sqrt(a));
-            break;
-          case 'sub':
-            b = stack.pop();
-            a = stack.pop();
-            stack.push(a - b);
-            break;
-          case 'true':
-            stack.push(true);
-            break;
-          case 'truncate':
-            a = stack.pop();
-            a = a < 0 ? Math.ceil(a) : Math.floor(a);
-            stack.push(a);
-            break;
-          case 'xor':
-            b = stack.pop();
-            a = stack.pop();
-            if (isBool(a) && isBool(b)) {
-              stack.push(a !== b);
-            } else {
-              stack.push(a ^ b);
-            }
-            break;
-          default:
-            throw new FormatError(`Unknown operator ${operator}`);
-        }
-      }
-      return stack.stack;
-    },
-  };
-  return PostScriptEvaluator;
-})();
-
-// Most of the PDFs functions consist of simple operations such as:
-//   roll, exch, sub, cvr, pop, index, dup, mul, if, gt, add.
-//
-// We can compile most of such programs, and at the same moment, we can
-// optimize some expressions using basic math properties. Keeping track of
-// min/max values will allow us to avoid extra Math.min/Math.max calls.
-var PostScriptCompiler = (function PostScriptCompilerClosure() {
-  function AstNode(type) {
-    this.type = type;
-  }
-  AstNode.prototype.visit = function (visitor) {
-    unreachable('abstract method');
-  };
-
-  function AstArgument(index, min, max) {
-    AstNode.call(this, 'args');
-    this.index = index;
-    this.min = min;
-    this.max = max;
-  }
-  AstArgument.prototype = Object.create(AstNode.prototype);
-  AstArgument.prototype.visit = function (visitor) {
-    visitor.visitArgument(this);
-  };
-
-  function AstLiteral(number) {
-    AstNode.call(this, 'literal');
-    this.number = number;
-    this.min = number;
-    this.max = number;
-  }
-  AstLiteral.prototype = Object.create(AstNode.prototype);
-  AstLiteral.prototype.visit = function (visitor) {
-    visitor.visitLiteral(this);
-  };
-
-  function AstBinaryOperation(op, arg1, arg2, min, max) {
-    AstNode.call(this, 'binary');
-    this.op = op;
-    this.arg1 = arg1;
-    this.arg2 = arg2;
-    this.min = min;
-    this.max = max;
-  }
-  AstBinaryOperation.prototype = Object.create(AstNode.prototype);
-  AstBinaryOperation.prototype.visit = function (visitor) {
-    visitor.visitBinaryOperation(this);
-  };
-
-  function AstMin(arg, max) {
-    AstNode.call(this, 'max');
-    this.arg = arg;
-    this.min = arg.min;
-    this.max = max;
-  }
-  AstMin.prototype = Object.create(AstNode.prototype);
-  AstMin.prototype.visit = function (visitor) {
-    visitor.visitMin(this);
-  };
-
-  function AstVariable(index, min, max) {
-    AstNode.call(this, 'var');
-    this.index = index;
-    this.min = min;
-    this.max = max;
-  }
-  AstVariable.prototype = Object.create(AstNode.prototype);
-  AstVariable.prototype.visit = function (visitor) {
-    visitor.visitVariable(this);
-  };
-
-  function AstVariableDefinition(variable, arg) {
-    AstNode.call(this, 'definition');
-    this.variable = variable;
-    this.arg = arg;
-  }
-  AstVariableDefinition.prototype = Object.create(AstNode.prototype);
-  AstVariableDefinition.prototype.visit = function (visitor) {
-    visitor.visitVariableDefinition(this);
-  };
-
-  function ExpressionBuilderVisitor() {
-    this.parts = [];
-  }
-  ExpressionBuilderVisitor.prototype = {
-    visitArgument(arg) {
-      this.parts.push('Math.max(', arg.min, ', Math.min(',
-                      arg.max, ', src[srcOffset + ', arg.index, ']))');
-    },
-    visitVariable(variable) {
-      this.parts.push('v', variable.index);
-    },
-    visitLiteral(literal) {
-      this.parts.push(literal.number);
-    },
-    visitBinaryOperation(operation) {
-      this.parts.push('(');
-      operation.arg1.visit(this);
-      this.parts.push(' ', operation.op, ' ');
-      operation.arg2.visit(this);
-      this.parts.push(')');
-    },
-    visitVariableDefinition(definition) {
-      this.parts.push('var ');
-      definition.variable.visit(this);
-      this.parts.push(' = ');
-      definition.arg.visit(this);
-      this.parts.push(';');
-    },
-    visitMin(max) {
-      this.parts.push('Math.min(');
-      max.arg.visit(this);
-      this.parts.push(', ', max.max, ')');
-    },
-    toString() {
-      return this.parts.join('');
-    },
-  };
-
-  function buildAddOperation(num1, num2) {
-    if (num2.type === 'literal' && num2.number === 0) {
-      // optimization: second operand is 0
-      return num1;
-    }
-    if (num1.type === 'literal' && num1.number === 0) {
-      // optimization: first operand is 0
-      return num2;
-    }
-    if (num2.type === 'literal' && num1.type === 'literal') {
-      // optimization: operands operand are literals
-      return new AstLiteral(num1.number + num2.number);
-    }
-    return new AstBinaryOperation('+', num1, num2,
-                                  num1.min + num2.min, num1.max + num2.max);
-  }
-
-  function buildMulOperation(num1, num2) {
-    if (num2.type === 'literal') {
-      // optimization: second operands is a literal...
-      if (num2.number === 0) {
-        return new AstLiteral(0); // and it's 0
-      } else if (num2.number === 1) {
-        return num1; // and it's 1
-      } else if (num1.type === 'literal') {
-        // ... and first operands is a literal too
-        return new AstLiteral(num1.number * num2.number);
-      }
-    }
-    if (num1.type === 'literal') {
-      // optimization: first operands is a literal...
-      if (num1.number === 0) {
-        return new AstLiteral(0); // and it's 0
-      } else if (num1.number === 1) {
-        return num2; // and it's 1
-      }
-    }
-    var min = Math.min(num1.min * num2.min, num1.min * num2.max,
-                       num1.max * num2.min, num1.max * num2.max);
-    var max = Math.max(num1.min * num2.min, num1.min * num2.max,
-                       num1.max * num2.min, num1.max * num2.max);
-    return new AstBinaryOperation('*', num1, num2, min, max);
-  }
-
-  function buildSubOperation(num1, num2) {
-    if (num2.type === 'literal') {
-      // optimization: second operands is a literal...
-      if (num2.number === 0) {
-        return num1; // ... and it's 0
-      } else if (num1.type === 'literal') {
-        // ... and first operands is a literal too
-        return new AstLiteral(num1.number - num2.number);
-      }
-    }
-    if (num2.type === 'binary' && num2.op === '-' &&
-      num1.type === 'literal' && num1.number === 1 &&
-      num2.arg1.type === 'literal' && num2.arg1.number === 1) {
-      // optimization for case: 1 - (1 - x)
-      return num2.arg2;
-    }
-    return new AstBinaryOperation('-', num1, num2,
-                                  num1.min - num2.max, num1.max - num2.min);
-  }
-
-  function buildMinOperation(num1, max) {
-    if (num1.min >= max) {
-      // optimization: num1 min value is not less than required max
-      return new AstLiteral(max); // just returning max
-    } else if (num1.max <= max) {
-      // optimization: num1 max value is not greater than required max
-      return num1; // just returning an argument
-    }
-    return new AstMin(num1, max);
-  }
-
-  function PostScriptCompiler() {}
-  PostScriptCompiler.prototype = {
-    compile: function PostScriptCompiler_compile(code, domain, range) {
-      var stack = [];
-      var i, ii;
-      var instructions = [];
-      var inputSize = domain.length >> 1, outputSize = range.length >> 1;
-      var lastRegister = 0;
-      var n, j;
-      var num1, num2, ast1, ast2, tmpVar, item;
-      for (i = 0; i < inputSize; i++) {
-        stack.push(new AstArgument(i, domain[i * 2], domain[i * 2 + 1]));
-      }
-
-      for (i = 0, ii = code.length; i < ii; i++) {
-        item = code[i];
-        if (typeof item === 'number') {
-          stack.push(new AstLiteral(item));
-          continue;
-        }
-
-        switch (item) {
-          case 'add':
-            if (stack.length < 2) {
-              return null;
-            }
-            num2 = stack.pop();
-            num1 = stack.pop();
-            stack.push(buildAddOperation(num1, num2));
-            break;
-          case 'cvr':
-            if (stack.length < 1) {
-              return null;
-            }
-            break;
-          case 'mul':
-            if (stack.length < 2) {
-              return null;
-            }
-            num2 = stack.pop();
-            num1 = stack.pop();
-            stack.push(buildMulOperation(num1, num2));
-            break;
-          case 'sub':
-            if (stack.length < 2) {
-              return null;
-            }
-            num2 = stack.pop();
-            num1 = stack.pop();
-            stack.push(buildSubOperation(num1, num2));
-            break;
-          case 'exch':
-            if (stack.length < 2) {
-              return null;
-            }
-            ast1 = stack.pop(); ast2 = stack.pop();
-            stack.push(ast1, ast2);
-            break;
-          case 'pop':
-            if (stack.length < 1) {
-              return null;
-            }
-            stack.pop();
-            break;
-          case 'index':
-            if (stack.length < 1) {
-              return null;
-            }
-            num1 = stack.pop();
-            if (num1.type !== 'literal') {
-              return null;
-            }
-            n = num1.number;
-            if (n < 0 || !Number.isInteger(n) || stack.length < n) {
-              return null;
-            }
-            ast1 = stack[stack.length - n - 1];
-            if (ast1.type === 'literal' || ast1.type === 'var') {
-              stack.push(ast1);
-              break;
-            }
-            tmpVar = new AstVariable(lastRegister++, ast1.min, ast1.max);
-            stack[stack.length - n - 1] = tmpVar;
-            stack.push(tmpVar);
-            instructions.push(new AstVariableDefinition(tmpVar, ast1));
-            break;
-          case 'dup':
-            if (stack.length < 1) {
-              return null;
-            }
-            if (typeof code[i + 1] === 'number' && code[i + 2] === 'gt' &&
-                code[i + 3] === i + 7 && code[i + 4] === 'jz' &&
-                code[i + 5] === 'pop' && code[i + 6] === code[i + 1]) {
-              // special case of the commands sequence for the min operation
-              num1 = stack.pop();
-              stack.push(buildMinOperation(num1, code[i + 1]));
-              i += 6;
-              break;
-            }
-            ast1 = stack[stack.length - 1];
-            if (ast1.type === 'literal' || ast1.type === 'var') {
-              // we don't have to save into intermediate variable a literal or
-              // variable.
-              stack.push(ast1);
-              break;
-            }
-            tmpVar = new AstVariable(lastRegister++, ast1.min, ast1.max);
-            stack[stack.length - 1] = tmpVar;
-            stack.push(tmpVar);
-            instructions.push(new AstVariableDefinition(tmpVar, ast1));
-            break;
-          case 'roll':
-            if (stack.length < 2) {
-              return null;
-            }
-            num2 = stack.pop();
-            num1 = stack.pop();
-            if (num2.type !== 'literal' || num1.type !== 'literal') {
-              // both roll operands must be numbers
-              return null;
-            }
-            j = num2.number;
-            n = num1.number;
-            if (n <= 0 || !Number.isInteger(n) || !Number.isInteger(j) ||
-                stack.length < n) {
-              // ... and integers
-              return null;
-            }
-            j = ((j % n) + n) % n;
-            if (j === 0) {
-              break; // just skipping -- there are nothing to rotate
-            }
-            Array.prototype.push.apply(stack,
-                                       stack.splice(stack.length - n, n - j));
-            break;
-          default:
-            return null; // unsupported operator
-        }
-      }
-
-      if (stack.length !== outputSize) {
-        return null;
-      }
-
-      var result = [];
-      instructions.forEach(function (instruction) {
-        var statementBuilder = new ExpressionBuilderVisitor();
-        instruction.visit(statementBuilder);
-        result.push(statementBuilder.toString());
-      });
-      stack.forEach(function (expr, i) {
-        var statementBuilder = new ExpressionBuilderVisitor();
-        expr.visit(statementBuilder);
-        var min = range[i * 2], max = range[i * 2 + 1];
-        var out = [statementBuilder.toString()];
-        if (min > expr.min) {
-          out.unshift('Math.max(', min, ', ');
-          out.push(')');
-        }
-        if (max < expr.max) {
-          out.unshift('Math.min(', max, ', ');
-          out.push(')');
-        }
-        out.unshift('dest[destOffset + ', i, '] = ');
-        out.push(';');
-        result.push(out.join(''));
-      });
-      return result.join('\n');
-    },
-  };
-
-  return PostScriptCompiler;
-})();
-
-export {
-  isPDFFunction,
-  PDFFunctionFactory,
-  PostScriptEvaluator,
-  PostScriptCompiler,
-};
+export { FunctionType, isPDFFunction, PDFFunctionFactory };

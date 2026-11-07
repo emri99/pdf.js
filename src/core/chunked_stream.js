@@ -13,562 +13,527 @@
  * limitations under the License.
  */
 
-import {
-  arrayByteLength, arraysToBytes, createPromiseCapability, isEmptyObj,
-  MissingDataException
-} from '../shared/util';
+import { arrayBuffersToBytes, MissingDataException } from "./core_utils.js";
+import { assert } from "../shared/util.js";
+import { MathClamp } from "../shared/math_clamp.js";
+import { Stream } from "./stream.js";
 
-var ChunkedStream = (function ChunkedStreamClosure() {
-  function ChunkedStream(length, chunkSize, manager) {
-    this.bytes = new Uint8Array(length);
-    this.start = 0;
-    this.pos = 0;
-    this.end = length;
+class ChunkedStream extends Stream {
+  progressiveDataLength = 0;
+
+  _lastSuccessfulEnsureByteChunk = -1; // Single-entry cache
+
+  _loadedChunks = new Set();
+
+  constructor(length, chunkSize, manager) {
+    super(
+      /* arrayBuffer = */ new Uint8Array(length),
+      /* start = */ 0,
+      /* length = */ length,
+      /* dict = */ null
+    );
+
     this.chunkSize = chunkSize;
-    this.loadedChunks = [];
-    this.numChunksLoaded = 0;
     this.numChunks = Math.ceil(length / chunkSize);
     this.manager = manager;
-    this.progressiveDataLength = 0;
-    this.lastSuccessfulEnsureByteChunk = -1;  // a single-entry cache
   }
 
-  // required methods for a stream. if a particular stream does not
-  // implement these, an error should be thrown
-  ChunkedStream.prototype = {
-
-    getMissingChunks: function ChunkedStream_getMissingChunks() {
-      var chunks = [];
-      for (var chunk = 0, n = this.numChunks; chunk < n; ++chunk) {
-        if (!this.loadedChunks[chunk]) {
-          chunks.push(chunk);
-        }
-      }
-      return chunks;
-    },
-
-    getBaseStreams: function ChunkedStream_getBaseStreams() {
-      return [this];
-    },
-
-    allChunksLoaded: function ChunkedStream_allChunksLoaded() {
-      return this.numChunksLoaded === this.numChunks;
-    },
-
-    onReceiveData: function ChunkedStream_onReceiveData(begin, chunk) {
-      var end = begin + chunk.byteLength;
-
-      if (begin % this.chunkSize !== 0) {
-        throw new Error(`Bad begin offset: ${begin}`);
-      }
-      // Using this.length is inaccurate here since this.start can be moved
-      // See ChunkedStream.moveStart()
-      var length = this.bytes.length;
-      if (end % this.chunkSize !== 0 && end !== length) {
-        throw new Error(`Bad end offset: ${end}`);
-      }
-
-      this.bytes.set(new Uint8Array(chunk), begin);
-      var chunkSize = this.chunkSize;
-      var beginChunk = Math.floor(begin / chunkSize);
-      var endChunk = Math.floor((end - 1) / chunkSize) + 1;
-      var curChunk;
-
-      for (curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
-        if (!this.loadedChunks[curChunk]) {
-          this.loadedChunks[curChunk] = true;
-          ++this.numChunksLoaded;
-        }
-      }
-    },
-
-    onReceiveProgressiveData:
-        function ChunkedStream_onReceiveProgressiveData(data) {
-      var position = this.progressiveDataLength;
-      var beginChunk = Math.floor(position / this.chunkSize);
-
-      this.bytes.set(new Uint8Array(data), position);
-      position += data.byteLength;
-      this.progressiveDataLength = position;
-      var endChunk = position >= this.end ? this.numChunks :
-                     Math.floor(position / this.chunkSize);
-      var curChunk;
-      for (curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
-        if (!this.loadedChunks[curChunk]) {
-          this.loadedChunks[curChunk] = true;
-          ++this.numChunksLoaded;
-        }
-      }
-    },
-
-    ensureByte: function ChunkedStream_ensureByte(pos) {
-      var chunk = Math.floor(pos / this.chunkSize);
-      if (chunk === this.lastSuccessfulEnsureByteChunk) {
-        return;
-      }
-
-      if (!this.loadedChunks[chunk]) {
-        throw new MissingDataException(pos, pos + 1);
-      }
-      this.lastSuccessfulEnsureByteChunk = chunk;
-    },
-
-    ensureRange: function ChunkedStream_ensureRange(begin, end) {
-      if (begin >= end) {
-        return;
-      }
-
-      if (end <= this.progressiveDataLength) {
-        return;
-      }
-
-      var chunkSize = this.chunkSize;
-      var beginChunk = Math.floor(begin / chunkSize);
-      var endChunk = Math.floor((end - 1) / chunkSize) + 1;
-      for (var chunk = beginChunk; chunk < endChunk; ++chunk) {
-        if (!this.loadedChunks[chunk]) {
-          throw new MissingDataException(begin, end);
-        }
-      }
-    },
-
-    nextEmptyChunk: function ChunkedStream_nextEmptyChunk(beginChunk) {
-      var chunk, numChunks = this.numChunks;
-      for (var i = 0; i < numChunks; ++i) {
-        chunk = (beginChunk + i) % numChunks; // Wrap around to beginning
-        if (!this.loadedChunks[chunk]) {
-          return chunk;
-        }
-      }
-      return null;
-    },
-
-    hasChunk: function ChunkedStream_hasChunk(chunk) {
-      return !!this.loadedChunks[chunk];
-    },
-
-    get length() {
-      return this.end - this.start;
-    },
-
-    get isEmpty() {
-      return this.length === 0;
-    },
-
-    getByte: function ChunkedStream_getByte() {
-      var pos = this.pos;
-      if (pos >= this.end) {
-        return -1;
-      }
-      this.ensureByte(pos);
-      return this.bytes[this.pos++];
-    },
-
-    getUint16: function ChunkedStream_getUint16() {
-      var b0 = this.getByte();
-      var b1 = this.getByte();
-      if (b0 === -1 || b1 === -1) {
-        return -1;
-      }
-      return (b0 << 8) + b1;
-    },
-
-    getInt32: function ChunkedStream_getInt32() {
-      var b0 = this.getByte();
-      var b1 = this.getByte();
-      var b2 = this.getByte();
-      var b3 = this.getByte();
-      return (b0 << 24) + (b1 << 16) + (b2 << 8) + b3;
-    },
-
-    // Returns subarray of original buffer, should only be read.
-    getBytes(length, forceClamped = false) {
-      var bytes = this.bytes;
-      var pos = this.pos;
-      var strEnd = this.end;
-
-      if (!length) {
-        this.ensureRange(pos, strEnd);
-        let subarray = bytes.subarray(pos, strEnd);
-        // `this.bytes` is always a `Uint8Array` here.
-        return (forceClamped ? new Uint8ClampedArray(subarray) : subarray);
-      }
-
-      var end = pos + length;
-      if (end > strEnd) {
-        end = strEnd;
-      }
-      this.ensureRange(pos, end);
-
-      this.pos = end;
-      let subarray = bytes.subarray(pos, end);
-      // `this.bytes` is always a `Uint8Array` here.
-      return (forceClamped ? new Uint8ClampedArray(subarray) : subarray);
-    },
-
-    peekByte: function ChunkedStream_peekByte() {
-      var peekedByte = this.getByte();
-      this.pos--;
-      return peekedByte;
-    },
-
-    peekBytes(length, forceClamped = false) {
-      var bytes = this.getBytes(length, forceClamped);
-      this.pos -= bytes.length;
-      return bytes;
-    },
-
-    getByteRange: function ChunkedStream_getBytes(begin, end) {
-      this.ensureRange(begin, end);
-      return this.bytes.subarray(begin, end);
-    },
-
-    skip: function ChunkedStream_skip(n) {
-      if (!n) {
-        n = 1;
-      }
-      this.pos += n;
-    },
-
-    reset: function ChunkedStream_reset() {
-      this.pos = this.start;
-    },
-
-    moveStart: function ChunkedStream_moveStart() {
-      this.start = this.pos;
-    },
-
-    makeSubStream: function ChunkedStream_makeSubStream(start, length, dict) {
-      this.ensureRange(start, start + length);
-
-      function ChunkedStreamSubstream() {}
-      ChunkedStreamSubstream.prototype = Object.create(this);
-      ChunkedStreamSubstream.prototype.getMissingChunks = function() {
-        var chunkSize = this.chunkSize;
-        var beginChunk = Math.floor(this.start / chunkSize);
-        var endChunk = Math.floor((this.end - 1) / chunkSize) + 1;
-        var missingChunks = [];
-        for (var chunk = beginChunk; chunk < endChunk; ++chunk) {
-          if (!this.loadedChunks[chunk]) {
-            missingChunks.push(chunk);
-          }
-        }
-        return missingChunks;
-      };
-      var subStream = new ChunkedStreamSubstream();
-      subStream.pos = subStream.start = start;
-      subStream.end = start + length || this.end;
-      subStream.dict = dict;
-      return subStream;
-    },
-  };
-
-  return ChunkedStream;
-})();
-
-var ChunkedStreamManager = (function ChunkedStreamManagerClosure() {
-
-  function ChunkedStreamManager(pdfNetworkStream, args) {
-    var chunkSize = args.rangeChunkSize;
-    var length = args.length;
-    this.stream = new ChunkedStream(length, chunkSize, this);
-    this.length = length;
-    this.chunkSize = chunkSize;
-    this.pdfNetworkStream = pdfNetworkStream;
-    this.url = args.url;
-    this.disableAutoFetch = args.disableAutoFetch;
-    this.msgHandler = args.msgHandler;
-
-    this.currRequestId = 0;
-
-    this.chunksNeededByRequest = Object.create(null);
-    this.requestsByChunk = Object.create(null);
-    this.promisesByRequest = Object.create(null);
-    this.progressiveDataLength = 0;
-    this.aborted = false;
-
-    this._loadedStreamCapability = createPromiseCapability();
-  }
-
-  ChunkedStreamManager.prototype = {
-    onLoadedStream: function ChunkedStreamManager_getLoadedStream() {
-      return this._loadedStreamCapability.promise;
-    },
-
-    sendRequest: function ChunkedStreamManager_sendRequest(begin, end) {
-      var rangeReader = this.pdfNetworkStream.getRangeReader(begin, end);
-      if (!rangeReader.isStreamingSupported) {
-        rangeReader.onProgress = this.onProgress.bind(this);
-      }
-      var chunks = [], loaded = 0;
-      var manager = this;
-      var promise = new Promise(function (resolve, reject) {
-        var readChunk = function (chunk) {
-          try {
-            if (!chunk.done) {
-              var data = chunk.value;
-              chunks.push(data);
-              loaded += arrayByteLength(data);
-              if (rangeReader.isStreamingSupported) {
-                manager.onProgress({ loaded, });
-              }
-              rangeReader.read().then(readChunk, reject);
-              return;
-            }
-            var chunkData = arraysToBytes(chunks);
-            chunks = null;
-            resolve(chunkData);
-          } catch (e) {
-            reject(e);
-          }
-        };
-        rangeReader.read().then(readChunk, reject);
-      });
-      promise.then((data) => {
-        if (this.aborted) {
-          return; // ignoring any data after abort
-        }
-        this.onReceiveData({ chunk: data, begin, });
-      });
-      // TODO check errors
-    },
-
-    // Get all the chunks that are not yet loaded and groups them into
-    // contiguous ranges to load in as few requests as possible
-    requestAllChunks: function ChunkedStreamManager_requestAllChunks() {
-      var missingChunks = this.stream.getMissingChunks();
-      this._requestChunks(missingChunks);
-      return this._loadedStreamCapability.promise;
-    },
-
-    _requestChunks: function ChunkedStreamManager_requestChunks(chunks) {
-      var requestId = this.currRequestId++;
-
-      var i, ii;
-      var chunksNeeded = Object.create(null);
-      this.chunksNeededByRequest[requestId] = chunksNeeded;
-      for (i = 0, ii = chunks.length; i < ii; i++) {
-        if (!this.stream.hasChunk(chunks[i])) {
-          chunksNeeded[chunks[i]] = true;
-        }
-      }
-
-      if (isEmptyObj(chunksNeeded)) {
-        return Promise.resolve();
-      }
-
-      var capability = createPromiseCapability();
-      this.promisesByRequest[requestId] = capability;
-
-      var chunksToRequest = [];
-      for (var chunk in chunksNeeded) {
-        chunk = chunk | 0;
-        if (!(chunk in this.requestsByChunk)) {
-          this.requestsByChunk[chunk] = [];
-          chunksToRequest.push(chunk);
-        }
-        this.requestsByChunk[chunk].push(requestId);
-      }
-
-      if (!chunksToRequest.length) {
-        return capability.promise;
-      }
-
-      var groupedChunksToRequest = this.groupChunks(chunksToRequest);
-
-      for (i = 0; i < groupedChunksToRequest.length; ++i) {
-        var groupedChunk = groupedChunksToRequest[i];
-        var begin = groupedChunk.beginChunk * this.chunkSize;
-        var end = Math.min(groupedChunk.endChunk * this.chunkSize, this.length);
-        this.sendRequest(begin, end);
-      }
-
-      return capability.promise;
-    },
-
-    getStream: function ChunkedStreamManager_getStream() {
-      return this.stream;
-    },
-
-    // Loads any chunks in the requested range that are not yet loaded
-    requestRange: function ChunkedStreamManager_requestRange(begin, end) {
-
-      end = Math.min(end, this.length);
-
-      var beginChunk = this.getBeginChunk(begin);
-      var endChunk = this.getEndChunk(end);
-
-      var chunks = [];
-      for (var chunk = beginChunk; chunk < endChunk; ++chunk) {
+  // If a particular stream does not implement one or more of these methods,
+  // an error should be thrown.
+  getMissingChunks() {
+    const chunks = [];
+    for (let chunk = 0, n = this.numChunks; chunk < n; ++chunk) {
+      if (!this._loadedChunks.has(chunk)) {
         chunks.push(chunk);
       }
+    }
+    return chunks;
+  }
 
-      return this._requestChunks(chunks);
-    },
+  get numChunksLoaded() {
+    return this._loadedChunks.size;
+  }
 
-    requestRanges: function ChunkedStreamManager_requestRanges(ranges) {
-      ranges = ranges || [];
-      var chunksToRequest = [];
+  get isDataLoaded() {
+    return this.numChunksLoaded === this.numChunks;
+  }
 
-      for (var i = 0; i < ranges.length; i++) {
-        var beginChunk = this.getBeginChunk(ranges[i].begin);
-        var endChunk = this.getEndChunk(ranges[i].end);
-        for (var chunk = beginChunk; chunk < endChunk; ++chunk) {
-          if (!chunksToRequest.includes(chunk)) {
-            chunksToRequest.push(chunk);
-          }
+  onReceiveData(begin, chunk) {
+    const chunkSize = this.chunkSize;
+    if (begin % chunkSize !== 0) {
+      throw new Error(`Bad begin offset: ${begin}`);
+    }
+
+    // Using `this.length` is inaccurate here since `this.start` can be moved
+    // (see the `moveStart` method).
+    const end = begin + chunk.byteLength;
+    if (end % chunkSize !== 0 && end !== this.bytes.length) {
+      throw new Error(`Bad end offset: ${end}`);
+    }
+
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+      assert(
+        chunk instanceof ArrayBuffer,
+        "onReceiveData - expected an ArrayBuffer."
+      );
+    }
+    this.bytes.set(new Uint8Array(chunk), begin);
+    const beginChunk = Math.floor(begin / chunkSize);
+    const endChunk = Math.floor((end - 1) / chunkSize) + 1;
+
+    for (let curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
+      this._loadedChunks.add(curChunk);
+    }
+  }
+
+  onReceiveProgressiveData(data) {
+    let position = this.progressiveDataLength;
+    const beginChunk = Math.floor(position / this.chunkSize);
+
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+      assert(
+        data instanceof ArrayBuffer,
+        "onReceiveProgressiveData - expected an ArrayBuffer."
+      );
+    }
+    this.bytes.set(new Uint8Array(data), position);
+    position += data.byteLength;
+    this.progressiveDataLength = position;
+    const endChunk =
+      position >= this.end
+        ? this.numChunks
+        : Math.floor(position / this.chunkSize);
+
+    for (let curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
+      this._loadedChunks.add(curChunk);
+    }
+  }
+
+  ensureByte(pos) {
+    if (pos < this.progressiveDataLength) {
+      return;
+    }
+
+    const chunk = Math.floor(pos / this.chunkSize);
+    if (
+      chunk > this.numChunks ||
+      chunk === this._lastSuccessfulEnsureByteChunk
+    ) {
+      return;
+    }
+
+    if (!this._loadedChunks.has(chunk)) {
+      throw new MissingDataException(pos, pos + 1);
+    }
+    this._lastSuccessfulEnsureByteChunk = chunk;
+  }
+
+  ensureRange(begin, end) {
+    if (begin >= end || end <= this.progressiveDataLength) {
+      return;
+    }
+
+    const beginChunk = Math.floor(begin / this.chunkSize);
+    if (beginChunk > this.numChunks) {
+      return;
+    }
+    const endChunk = Math.min(
+      Math.floor((end - 1) / this.chunkSize) + 1,
+      this.numChunks
+    );
+    for (let chunk = beginChunk; chunk < endChunk; ++chunk) {
+      if (!this._loadedChunks.has(chunk)) {
+        throw new MissingDataException(begin, end);
+      }
+    }
+  }
+
+  nextEmptyChunk(beginChunk) {
+    const numChunks = this.numChunks;
+    for (let i = 0; i < numChunks; ++i) {
+      const chunk = (beginChunk + i) % numChunks; // Wrap around to beginning.
+      if (!this._loadedChunks.has(chunk)) {
+        return chunk;
+      }
+    }
+    return null;
+  }
+
+  hasChunk(chunk) {
+    return this._loadedChunks.has(chunk);
+  }
+
+  getByte() {
+    const pos = this.pos;
+    if (pos >= this.end) {
+      return -1;
+    }
+    if (pos >= this.progressiveDataLength) {
+      this.ensureByte(pos);
+    }
+    return this.bytes[this.pos++];
+  }
+
+  getBytes(length) {
+    const pos = this.pos;
+    const endPos = !length ? this.end : Math.min(pos + length, this.end);
+
+    if (endPos > this.progressiveDataLength) {
+      this.ensureRange(pos, endPos);
+    }
+    this.pos = endPos;
+    return this.bytes.subarray(pos, endPos);
+  }
+
+  getByteRange(begin, end) {
+    if (begin < 0) {
+      begin = 0;
+    }
+    if (end > this.end) {
+      end = this.end;
+    }
+    if (end > this.progressiveDataLength) {
+      this.ensureRange(begin, end);
+    }
+    return this.bytes.subarray(begin, end);
+  }
+
+  makeSubStream(start, length, dict = null) {
+    if (length) {
+      if (start + length > this.progressiveDataLength) {
+        this.ensureRange(start, start + length);
+      }
+    } else if (start >= this.progressiveDataLength) {
+      // When the `length` is undefined you do *not*, under any circumstances,
+      // want to fallback on calling `this.ensureRange(start, this.end)` since
+      // that would force the *entire* PDF file to be loaded, thus completely
+      // breaking the whole purpose of using streaming and/or range requests.
+      //
+      // However, not doing any checking here could very easily lead to wasted
+      // time/resources during e.g. parsing, since `MissingDataException`s will
+      // require data to be re-parsed, which we attempt to minimize by at least
+      // checking that the *beginning* of the data is available here.
+      this.ensureByte(start);
+    }
+
+    function ChunkedStreamSubstream() {}
+    ChunkedStreamSubstream.prototype = Object.create(this);
+    ChunkedStreamSubstream.prototype.getMissingChunks = function () {
+      const chunkSize = this.chunkSize;
+      const beginChunk = Math.floor(this.start / chunkSize);
+      const endChunk = Math.floor((this.end - 1) / chunkSize) + 1;
+      const missingChunks = [];
+      for (let chunk = beginChunk; chunk < endChunk; ++chunk) {
+        if (!this._loadedChunks.has(chunk)) {
+          missingChunks.push(chunk);
         }
       }
+      return missingChunks;
+    };
+    Object.defineProperty(ChunkedStreamSubstream.prototype, "isDataLoaded", {
+      get() {
+        return (
+          this.numChunksLoaded === this.numChunks ||
+          this.getMissingChunks().length === 0
+        );
+      },
+      configurable: true,
+    });
 
-      chunksToRequest.sort(function(a, b) {
-        return a - b;
-      });
-      return this._requestChunks(chunksToRequest);
-    },
+    const subStream = new ChunkedStreamSubstream();
+    subStream.pos = subStream.start = start;
+    subStream.end = start + length || this.end;
+    subStream.dict = dict;
+    return subStream;
+  }
 
-    // Groups a sorted array of chunks into as few contiguous larger
-    // chunks as possible
-    groupChunks: function ChunkedStreamManager_groupChunks(chunks) {
-      var groupedChunks = [];
-      var beginChunk = -1;
-      var prevChunk = -1;
-      for (var i = 0; i < chunks.length; ++i) {
-        var chunk = chunks[i];
+  getBaseStreams() {
+    return [this];
+  }
+}
 
-        if (beginChunk < 0) {
-          beginChunk = chunk;
-        }
+class ChunkedStreamManager {
+  #abortReason = null;
 
-        if (prevChunk >= 0 && prevChunk + 1 !== chunk) {
-          groupedChunks.push({ beginChunk,
-                               endChunk: prevChunk + 1, });
-          beginChunk = chunk;
-        }
-        if (i + 1 === chunks.length) {
-          groupedChunks.push({ beginChunk,
-                               endChunk: chunk + 1, });
-        }
+  #requestId = 0;
 
-        prevChunk = chunk;
+  #chunksNeededByRequest = new Map();
+
+  #loadedStreamCapability = Promise.withResolvers();
+
+  _promisesByRequest = new Map();
+
+  _requestsByChunk = new Map();
+
+  constructor(pdfStream, args) {
+    this.length = args.length;
+    this.chunkSize = args.rangeChunkSize;
+    this.stream = new ChunkedStream(this.length, this.chunkSize, this);
+    this.pdfStream = pdfStream;
+    this.disableAutoFetch = args.disableAutoFetch;
+    this.msgHandler = args.msgHandler;
+  }
+
+  async sendRequest(begin, end) {
+    const rangeReader = this.pdfStream.getRangeReader(begin, end);
+    let chunks = [];
+
+    while (true) {
+      const { value, done } = await rangeReader.read();
+
+      if (this.#abortReason) {
+        chunks = null;
+        return; // Ignoring any data after abort.
       }
-      return groupedChunks;
-    },
+      if (done) {
+        break;
+      }
+      if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+        assert(
+          value instanceof ArrayBuffer,
+          "sendRequest - expected an ArrayBuffer."
+        );
+      }
+      chunks.push(value);
+    }
 
-    onProgress: function ChunkedStreamManager_onProgress(args) {
-      var bytesLoaded = (this.stream.numChunksLoaded * this.chunkSize +
-                         args.loaded);
-      this.msgHandler.send('DocProgress', {
-        loaded: bytesLoaded,
-        total: this.length,
-      });
-    },
+    if (chunks.length === 0 && this.disableAutoFetch) {
+      // The range request wasn't dispatched, see the "GetRangeReader" handler
+      // in the `src/display/api.js` file.
+      return;
+    }
+    const data = arrayBuffersToBytes(chunks);
+    chunks = null;
+    this.onReceiveData({ chunk: data.buffer, begin });
+  }
 
-    onReceiveData: function ChunkedStreamManager_onReceiveData(args) {
-      var chunk = args.chunk;
-      var isProgressive = args.begin === undefined;
-      var begin = isProgressive ? this.progressiveDataLength : args.begin;
-      var end = begin + chunk.byteLength;
+  /**
+   * Get all the chunks that are not yet loaded and group them into
+   * contiguous ranges to load in as few requests as possible.
+   */
+  requestAllChunks(noFetch = false) {
+    if (!noFetch && !this.#abortReason) {
+      const missingChunks = this.stream.getMissingChunks();
+      this.#requestChunks(missingChunks);
+    }
+    return this.#loadedStreamCapability.promise;
+  }
 
-      var beginChunk = Math.floor(begin / this.chunkSize);
-      var endChunk = end < this.length ? Math.floor(end / this.chunkSize) :
-                                         Math.ceil(end / this.chunkSize);
+  #requestChunks(chunks) {
+    if (this.#abortReason) {
+      return Promise.reject(this.#abortReason);
+    }
 
-      if (isProgressive) {
-        this.stream.onReceiveProgressiveData(chunk);
-        this.progressiveDataLength = end;
+    const chunksNeeded = new Set();
+    for (const chunk of chunks) {
+      if (!this.stream.hasChunk(chunk)) {
+        chunksNeeded.add(chunk);
+      }
+    }
+
+    if (chunksNeeded.size === 0) {
+      return Promise.resolve();
+    }
+    const requestId = this.#requestId++;
+    this.#chunksNeededByRequest.set(requestId, chunksNeeded);
+
+    const capability = Promise.withResolvers();
+    this._promisesByRequest.set(requestId, capability);
+
+    const chunksToRequest = [];
+    for (const chunk of chunksNeeded) {
+      const requestIds = this._requestsByChunk.getOrInsertComputed(
+        chunk,
+        () => {
+          chunksToRequest.push(chunk);
+          return [];
+        }
+      );
+      requestIds.push(requestId);
+    }
+
+    if (chunksToRequest.length > 0) {
+      const groupedChunksToRequest = this.groupChunks(chunksToRequest);
+      for (const groupedChunk of groupedChunksToRequest) {
+        const begin = groupedChunk.beginChunk * this.chunkSize;
+        const end = Math.min(
+          groupedChunk.endChunk * this.chunkSize,
+          this.length
+        );
+        this.sendRequest(begin, end).catch(capability.reject);
+      }
+    }
+
+    // Prevent "uncaught exception: Object"-messages in the console.
+    capability.promise.catch(() => {});
+
+    return capability.promise;
+  }
+
+  getStream() {
+    return this.stream;
+  }
+
+  /**
+   * Loads any chunks in the requested range that are not yet loaded.
+   */
+  requestRange(begin, end) {
+    end = Math.min(end, this.length);
+
+    const beginChunk = this.getBeginChunk(begin);
+    const endChunk = this.getEndChunk(end);
+
+    const chunks = [];
+    for (let chunk = beginChunk; chunk < endChunk; ++chunk) {
+      chunks.push(chunk);
+    }
+    return this.#requestChunks(chunks);
+  }
+
+  requestRanges(ranges = []) {
+    const chunksToRequest = [];
+    for (const range of ranges) {
+      const beginChunk = this.getBeginChunk(range.begin);
+      const endChunk = this.getEndChunk(range.end);
+      for (let chunk = beginChunk; chunk < endChunk; ++chunk) {
+        if (!chunksToRequest.includes(chunk)) {
+          chunksToRequest.push(chunk);
+        }
+      }
+    }
+
+    chunksToRequest.sort((a, b) => a - b);
+    return this.#requestChunks(chunksToRequest);
+  }
+
+  /**
+   * Groups a sorted array of chunks into as few contiguous larger
+   * chunks as possible.
+   */
+  groupChunks(chunks) {
+    const groupedChunks = [];
+    let beginChunk = -1;
+    let prevChunk = -1;
+
+    for (let i = 0, ii = chunks.length; i < ii; ++i) {
+      const chunk = chunks[i];
+      if (beginChunk < 0) {
+        beginChunk = chunk;
+      }
+
+      if (prevChunk >= 0 && prevChunk + 1 !== chunk) {
+        groupedChunks.push({ beginChunk, endChunk: prevChunk + 1 });
+        beginChunk = chunk;
+      }
+      if (i + 1 === chunks.length) {
+        groupedChunks.push({ beginChunk, endChunk: chunk + 1 });
+      }
+
+      prevChunk = chunk;
+    }
+    return groupedChunks;
+  }
+
+  onReceiveData(args) {
+    const { chunkSize, length, stream } = this;
+
+    const chunk = args.chunk;
+    const isProgressive = args.begin === undefined;
+    const begin = isProgressive ? stream.progressiveDataLength : args.begin;
+    const end = begin + chunk.byteLength;
+
+    const beginChunk = Math.floor(begin / chunkSize);
+    const endChunk =
+      end < length ? Math.floor(end / chunkSize) : Math.ceil(end / chunkSize);
+
+    if (isProgressive) {
+      stream.onReceiveProgressiveData(chunk);
+    } else {
+      stream.onReceiveData(begin, chunk);
+    }
+
+    if (stream.isDataLoaded) {
+      this.#loadedStreamCapability.resolve(stream);
+    }
+
+    const loadedRequests = [];
+    for (let curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
+      // The server might return more chunks than requested.
+      const requestIds = this._requestsByChunk.get(curChunk);
+      if (!requestIds) {
+        continue;
+      }
+      this._requestsByChunk.delete(curChunk);
+
+      for (const requestId of requestIds) {
+        const chunksNeeded = this.#chunksNeededByRequest.get(requestId);
+        chunksNeeded.delete(curChunk);
+
+        if (chunksNeeded.size > 0) {
+          continue;
+        }
+        loadedRequests.push(requestId);
+      }
+    }
+
+    // If there are no pending requests, automatically fetch the next
+    // unfetched chunk of the PDF file.
+    if (
+      !this.disableAutoFetch &&
+      !this._requestsByChunk.size &&
+      !this.#abortReason
+    ) {
+      let nextEmptyChunk;
+      if (stream.numChunksLoaded === 1) {
+        // This is a special optimization so that after fetching the first
+        // chunk, rather than fetching the second chunk, we fetch the last
+        // chunk.
+        const lastChunk = stream.numChunks - 1;
+        if (!stream.hasChunk(lastChunk)) {
+          nextEmptyChunk = lastChunk;
+        }
       } else {
-        this.stream.onReceiveData(begin, chunk);
+        nextEmptyChunk = stream.nextEmptyChunk(endChunk);
       }
-
-      if (this.stream.allChunksLoaded()) {
-        this._loadedStreamCapability.resolve(this.stream);
+      if (Number.isInteger(nextEmptyChunk)) {
+        this.#requestChunks([nextEmptyChunk]);
       }
+    }
 
-      var loadedRequests = [];
-      var i, requestId;
-      for (chunk = beginChunk; chunk < endChunk; ++chunk) {
-        // The server might return more chunks than requested
-        var requestIds = this.requestsByChunk[chunk] || [];
-        delete this.requestsByChunk[chunk];
+    for (const requestId of loadedRequests) {
+      const capability = this._promisesByRequest.get(requestId);
+      this._promisesByRequest.delete(requestId);
+      capability.resolve();
+    }
 
-        for (i = 0; i < requestIds.length; ++i) {
-          requestId = requestIds[i];
-          var chunksNeeded = this.chunksNeededByRequest[requestId];
-          if (chunk in chunksNeeded) {
-            delete chunksNeeded[chunk];
-          }
+    this.msgHandler.send("DocProgress", {
+      loaded: MathClamp(
+        stream.numChunksLoaded * chunkSize,
+        stream.progressiveDataLength,
+        length
+      ),
+      total: length,
+    });
+  }
 
-          if (!isEmptyObj(chunksNeeded)) {
-            continue;
-          }
+  getBeginChunk(begin) {
+    return Math.floor(begin / this.chunkSize);
+  }
 
-          loadedRequests.push(requestId);
-        }
-      }
+  getEndChunk(end) {
+    return Math.floor((end - 1) / this.chunkSize) + 1;
+  }
 
-      // If there are no pending requests, automatically fetch the next
-      // unfetched chunk of the PDF
-      if (!this.disableAutoFetch && isEmptyObj(this.requestsByChunk)) {
-        var nextEmptyChunk;
-        if (this.stream.numChunksLoaded === 1) {
-          // This is a special optimization so that after fetching the first
-          // chunk, rather than fetching the second chunk, we fetch the last
-          // chunk.
-          var lastChunk = this.stream.numChunks - 1;
-          if (!this.stream.hasChunk(lastChunk)) {
-            nextEmptyChunk = lastChunk;
-          }
-        } else {
-          nextEmptyChunk = this.stream.nextEmptyChunk(endChunk);
-        }
-        if (Number.isInteger(nextEmptyChunk)) {
-          this._requestChunks([nextEmptyChunk]);
-        }
-      }
+  abort(reason) {
+    assert(reason instanceof Error, "abort must have a valid reason");
+    this.#abortReason = reason;
+    this.pdfStream?.cancelAllRequests(reason);
 
-      for (i = 0; i < loadedRequests.length; ++i) {
-        requestId = loadedRequests[i];
-        var capability = this.promisesByRequest[requestId];
-        delete this.promisesByRequest[requestId];
-        capability.resolve();
-      }
+    for (const capability of this._promisesByRequest.values()) {
+      capability.reject(reason);
+    }
+    this.#loadedStreamCapability.reject(reason);
+  }
+}
 
-      this.msgHandler.send('DocProgress', {
-        loaded: this.stream.numChunksLoaded * this.chunkSize,
-        total: this.length,
-      });
-    },
-
-    onError: function ChunkedStreamManager_onError(err) {
-      this._loadedStreamCapability.reject(err);
-    },
-
-    getBeginChunk: function ChunkedStreamManager_getBeginChunk(begin) {
-      var chunk = Math.floor(begin / this.chunkSize);
-      return chunk;
-    },
-
-    getEndChunk: function ChunkedStreamManager_getEndChunk(end) {
-      var chunk = Math.floor((end - 1) / this.chunkSize) + 1;
-      return chunk;
-    },
-
-    abort: function ChunkedStreamManager_abort() {
-      this.aborted = true;
-      if (this.pdfNetworkStream) {
-        this.pdfNetworkStream.cancelAllRequests('abort');
-      }
-      for (var requestId in this.promisesByRequest) {
-        var capability = this.promisesByRequest[requestId];
-        capability.reject(new Error('Request was aborted'));
-      }
-    },
-  };
-
-  return ChunkedStreamManager;
-})();
-
-export {
-  ChunkedStream,
-  ChunkedStreamManager,
-};
+export { ChunkedStream, ChunkedStreamManager };

@@ -34,130 +34,60 @@
  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-/* globals jasmineRequire, TestReporter */
 
 // Modified jasmine's boot.js file to load PDF.js libraries async.
 
-'use strict';
+"use strict";
 
-function initializePDFJS(callback) {
-  Promise.all([SystemJS.import('pdfjs/core/fonts'),
-               SystemJS.import('pdfjs/core/stream'),
-               SystemJS.import('pdfjs/core/primitives'),
-               SystemJS.import('pdfjs/core/cmap')])
-         .then(function (modules) {
-    var fonts = modules[0], stream = modules[1],
-        primitives = modules[2], cmap = modules[3];
-    // Expose some of the PDFJS members to global scope for tests.
-    window.Font = fonts.Font;
-    window.ToUnicodeMap = fonts.ToUnicodeMap;
-    window.Stream = stream.Stream;
-    window.Name = primitives.Name;
-    window.CMapFactory = cmap.CMapFactory;
+import { TestReporter } from "../reporter.js";
 
-    callback();
-  });
+async function initializePDFJS(callback) {
+  await Promise.all(
+    [
+      "pdfjs-test/font/font_core_spec.js",
+      "pdfjs-test/font/font_glyf_spec.js",
+      "pdfjs-test/font/font_os2_spec.js",
+      "pdfjs-test/font/font_post_spec.js",
+      "pdfjs-test/font/font_fpgm_spec.js",
+    ].map(moduleName => import(moduleName)) // eslint-disable-line no-unsanitized/method
+  );
+
+  callback();
 }
 
-(function() {
-  window.jasmine = jasmineRequire.core(jasmineRequire);
-
-  jasmineRequire.html(jasmine);
-
-  var env = jasmine.getEnv();
-
-  var jasmineInterface = jasmineRequire.interface(jasmine, env);
-  extend(window, jasmineInterface);
+(function () {
+  const env = jasmine.getEnv();
 
   // Runner Parameters
-  var queryString = new jasmine.QueryString({
-    getWindowLocation() {
-      return window.location;
-    },
-  });
+  const urls = new jasmine.HtmlReporterV2Urls();
 
-  var config = {
-    failFast: queryString.getParam('failFast'),
-    oneFailurePerSpec: queryString.getParam('oneFailurePerSpec'),
-    hideDisabled: queryString.getParam('hideDisabled'),
-  };
-
-  var random = queryString.getParam('random');
-  if (random !== undefined && random !== '') {
-    config.random = random;
-  }
-
-  var seed = queryString.getParam('seed');
-  if (seed) {
-    config.seed = seed;
-  }
+  env.configure(urls.configFromCurrentUrl());
 
   // Reporters
-  var htmlReporter = new jasmine.HtmlReporter({
-    env,
-    navigateWithNewParam(key, value) {
-      return queryString.navigateWithNewParam(key, value);
-    },
-    addToExistingQueryString(key, value) {
-      return queryString.fullStringWithNewParam(key, value);
-    },
-    getContainer() {
-      return document.body;
-    },
-    createElement() {
-      return document.createElement.apply(document, arguments);
-    },
-    createTextNode() {
-      return document.createTextNode.apply(document, arguments);
-    },
-    timer: new jasmine.Timer(),
-  });
+  const htmlReporter = new jasmine.HtmlReporterV2({ env, urls });
 
   env.addReporter(htmlReporter);
 
-  if (queryString.getParam('browser')) {
-    var testReporter = new TestReporter(queryString.getParam('browser'),
-                                        queryString.getParam('path'));
+  if (urls.queryString.getParam("browser")) {
+    const testReporter = new TestReporter(urls.queryString.getParam("browser"));
     env.addReporter(testReporter);
   }
-
-  // Filter which specs will be run by matching the start of the full name
-  // against the `spec` query param.
-  var specFilter = new jasmine.HtmlSpecFilter({
-    filterString() {
-      return queryString.getParam('spec');
-    },
-  });
-
-  config.specFilter = function(spec) {
-    return specFilter.matches(spec.getFullName());
-  };
-
-  env.configure(config);
 
   // Sets longer timeout.
   jasmine.DEFAULT_TIMEOUT_INTERVAL = 30000;
 
-  // Replace the browser window's `onload`, ensure it's called, and then run
-  // all of the loaded specs. This includes initializing the `HtmlReporter`
-  // instance and then executing the loaded Jasmine environment.
-  var currentWindowOnload = window.onload;
-
-  window.onload = function() {
-    if (currentWindowOnload) {
-      currentWindowOnload();
-    }
-
+  function fontTestInit() {
     initializePDFJS(function () {
-      htmlReporter.initialize();
       env.execute();
     });
-  };
-
-  function extend(destination, source) {
-    for (var property in source) {
-      destination[property] = source[property];
-    }
-    return destination;
   }
-}());
+
+  if (
+    document.readyState === "interactive" ||
+    document.readyState === "complete"
+  ) {
+    fontTestInit();
+  } else {
+    document.addEventListener("DOMContentLoaded", fontTestInit, true);
+  }
+})();

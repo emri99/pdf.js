@@ -13,30 +13,34 @@
  * limitations under the License.
  */
 
-import { getEncoding } from '../../src/core/encodings';
+import { getEncoding } from "../../src/core/encodings.js";
 
-describe('encodings', function() {
-  describe('getEncoding', function() {
-    it('fetches a valid array for known encoding names', function() {
+describe("encodings", function () {
+  describe("getEncoding", function () {
+    it("fetches a valid array for known encoding names", function () {
       const knownEncodingNames = [
-        'ExpertEncoding', 'MacExpertEncoding', 'MacRomanEncoding',
-        'StandardEncoding', 'SymbolSetEncoding', 'WinAnsiEncoding',
-        'ZapfDingbatsEncoding',
+        "ExpertEncoding",
+        "MacExpertEncoding",
+        "MacRomanEncoding",
+        "StandardEncoding",
+        "SymbolSetEncoding",
+        "WinAnsiEncoding",
+        "ZapfDingbatsEncoding",
       ];
 
       for (const knownEncodingName of knownEncodingNames) {
         const encoding = getEncoding(knownEncodingName);
-        expect(Array.isArray(encoding)).toEqual(true);
+        expect(Array.isArray(encoding)).toBeTrue();
         expect(encoding.length).toEqual(256);
 
         for (const item of encoding) {
-          expect(typeof item).toEqual('string');
+          expect(typeof item).toEqual("string");
         }
       }
     });
 
-    it('fetches `null` for unknown encoding names', function() {
-      expect(getEncoding('FooBarEncoding')).toEqual(null);
+    it("fetches `null` for unknown encoding names", function () {
+      expect(getEncoding("FooBarEncoding")).toBeNull();
     });
   });
 });

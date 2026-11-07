@@ -13,79 +13,52 @@
  * limitations under the License.
  */
 
-import {
-  apiCompatibilityParams, createObjectURL, createValidAbsoluteUrl, URL
-} from 'pdfjs-lib';
+import { BaseDownloadManager } from "./base_download_manager.js";
+import { createValidAbsoluteUrl } from "pdfjs-lib";
 
-if (typeof PDFJSDev !== 'undefined' && !PDFJSDev.test('CHROME || GENERIC')) {
-  throw new Error('Module "pdfjs-web/download_manager" shall not be used ' +
-                  'outside CHROME and GENERIC builds.');
+if (typeof PDFJSDev !== "undefined" && !PDFJSDev.test("CHROME || GENERIC")) {
+  throw new Error(
+    'Module "pdfjs-web/download_manager" shall not be used ' +
+      "outside CHROME and GENERIC builds."
+  );
 }
 
-const DISABLE_CREATE_OBJECT_URL =
-  apiCompatibilityParams.disableCreateObjectURL || false;
-
-function download(blobUrl, filename) {
-  let a = document.createElement('a');
-  if (!a.click) {
-    throw new Error('DownloadManager: "a.click()" is not supported.');
-  }
-  a.href = blobUrl;
-  a.target = '_parent';
-  // Use a.download if available. This increases the likelihood that
-  // the file is downloaded instead of opened by another PDF plugin.
-  if ('download' in a) {
-    a.download = filename;
-  }
-  // <a> must be in the document for IE and recent Firefox versions,
-  // otherwise .click() is ignored.
-  (document.body || document.documentElement).appendChild(a);
-  a.click();
-  a.remove();
-}
-
-class DownloadManager {
-  constructor({ disableCreateObjectURL = DISABLE_CREATE_OBJECT_URL, }) {
-    this.disableCreateObjectURL = disableCreateObjectURL;
-  }
-
-  downloadUrl(url, filename) {
-    if (!createValidAbsoluteUrl(url, 'http://example.com')) {
-      return; // restricted/invalid URL
-    }
-    download(url + '#pdfjs.action=download', filename);
-  }
-
-  downloadData(data, filename, contentType) {
-    if (navigator.msSaveBlob) { // IE10 and above
-      return navigator.msSaveBlob(new Blob([data], { type: contentType, }),
-                                  filename);
-    }
-    let blobUrl = createObjectURL(data, contentType,
-                                  this.disableCreateObjectURL);
-    download(blobUrl, filename);
-  }
-
-  download(blob, url, filename) {
-    if (navigator.msSaveBlob) {
-      // IE10 / IE11
-      if (!navigator.msSaveBlob(blob, filename)) {
-        this.downloadUrl(url, filename);
+class DownloadManager extends BaseDownloadManager {
+  _triggerDownload(blobUrl, originalUrl, filename, isAttachment = false) {
+    if (!blobUrl && !isAttachment) {
+      // Fallback to downloading non-attachments by their URL.
+      if (!createValidAbsoluteUrl(originalUrl, "http://example.com")) {
+        throw new Error(`_triggerDownload - not a valid URL: ${originalUrl}`);
       }
-      return;
+      blobUrl = originalUrl + "#pdfjs.action=download";
     }
 
-    if (this.disableCreateObjectURL) {
-      // URL.createObjectURL is not supported
-      this.downloadUrl(url, filename);
-      return;
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.target = "_parent";
+    // Use a.download if available. This increases the likelihood that
+    // the file is downloaded instead of opened by another PDF plugin.
+    if ("download" in a) {
+      a.download = filename;
     }
+    // <a> must be in the document for recent Firefox versions,
+    // otherwise .click() is ignored.
+    (document.body || document.documentElement).append(a);
+    a.click();
+    a.remove();
+  }
 
-    let blobUrl = URL.createObjectURL(blob);
-    download(blobUrl, filename);
+  _getOpenDataUrl(blobUrl, filename, dest = null) {
+    if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("COMPONENTS")) {
+      throw new Error("Opening data is not supported in `COMPONENTS` builds.");
+    }
+    // The current URL is the viewer, let's use it and append the file.
+    let url = "?file=" + encodeURIComponent(blobUrl + "#" + filename);
+    if (dest) {
+      url += `#${escape(dest)}`;
+    }
+    return url;
   }
 }
 
-export {
-  DownloadManager,
-};
+export { DownloadManager };

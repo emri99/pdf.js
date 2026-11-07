@@ -13,236 +13,245 @@
  * limitations under the License.
  */
 
-import { assert, createPromiseCapability } from '../shared/util';
+import {
+  BasePDFStream,
+  BasePDFStreamRangeReader,
+  BasePDFStreamReader,
+} from "../shared/base_pdf_stream.js";
+import { assert } from "../shared/util.js";
+import { isPdfFile } from "./dom_utils.js";
 
- /** @implements {IPDFStream} */
-var PDFDataTransportStream = (function PDFDataTransportStreamClosure() {
-  function PDFDataTransportStream(params, pdfDataRangeTransport) {
-    assert(pdfDataRangeTransport);
+function getArrayBuffer(val) {
+  // Prevent any possible issues by only transferring a Uint8Array that
+  // completely "utilizes" its underlying ArrayBuffer.
+  return val instanceof Uint8Array && val.byteLength === val.buffer.byteLength
+    ? val.buffer
+    : new Uint8Array(val).buffer;
+}
 
-    this._queuedChunks = [];
-    var initialData = params.initialData;
-    if (initialData && initialData.length > 0) {
-      let buffer = new Uint8Array(initialData).buffer;
+function endRequests() {
+  for (const capability of this._requests) {
+    capability.resolve({ value: undefined, done: true });
+  }
+  this._requests.length = 0;
+}
+
+class PDFDataTransportStream extends BasePDFStream {
+  _progressiveDone = false;
+
+  _queuedChunks = [];
+
+  constructor(source) {
+    super(
+      source,
+      PDFDataTransportStreamReader,
+      PDFDataTransportStreamRangeReader
+    );
+    const { pdfDataRangeTransport } = source;
+    const { initialData, progressiveDone } = pdfDataRangeTransport;
+
+    if (initialData?.length > 0) {
+      const buffer = getArrayBuffer(initialData);
       this._queuedChunks.push(buffer);
     }
+    this._progressiveDone = progressiveDone;
 
-    this._pdfDataRangeTransport = pdfDataRangeTransport;
-    this._isStreamingSupported = !params.disableStream;
-    this._isRangeSupported = !params.disableRange;
-    this._contentLength = params.length;
-
-    this._fullRequestReader = null;
-    this._rangeReaders = [];
-
-    this._pdfDataRangeTransport.addRangeListener((begin, chunk) => {
-      this._onReceiveData({ begin, chunk, });
-    });
-
-    this._pdfDataRangeTransport.addProgressListener((loaded) => {
-      this._onProgress({ loaded, });
-    });
-
-    this._pdfDataRangeTransport.addProgressiveReadListener((chunk) => {
-      this._onReceiveData({ chunk, });
-    });
-
-    this._pdfDataRangeTransport.transportReady();
+    const listener = args => {
+      switch (args.type) {
+        case "range":
+        case "progressiveRead":
+          this.#onReceiveData(args.begin, args.chunk);
+          break;
+        case "progressiveDone":
+          this._fullReader?.progressiveDone();
+          this._progressiveDone = true;
+          break;
+      }
+    };
+    pdfDataRangeTransport.transportReady(listener);
   }
-  PDFDataTransportStream.prototype = {
-    _onReceiveData: function PDFDataTransportStream_onReceiveData(args) {
-       let buffer = new Uint8Array(args.chunk).buffer;
-       if (args.begin === undefined) {
-         if (this._fullRequestReader) {
-           this._fullRequestReader._enqueue(buffer);
-         } else {
-           this._queuedChunks.push(buffer);
-         }
-       } else {
-         var found = this._rangeReaders.some(function (rangeReader) {
-           if (rangeReader._begin !== args.begin) {
-             return false;
-           }
-           rangeReader._enqueue(buffer);
-           return true;
-         });
-         assert(found);
-       }
-    },
 
-    _onProgress: function PDFDataTransportStream_onDataProgress(evt) {
-       if (this._rangeReaders.length > 0) {
-         // Reporting to first range reader.
-         var firstReader = this._rangeReaders[0];
-         if (firstReader.onProgress) {
-           firstReader.onProgress({ loaded: evt.loaded, });
-         }
-       }
-    },
+  #onReceiveData(begin, chunk) {
+    const buffer = getArrayBuffer(chunk);
 
-    _removeRangeReader:
-        function PDFDataTransportStream_removeRangeReader(reader) {
-      var i = this._rangeReaders.indexOf(reader);
-      if (i >= 0) {
-        this._rangeReaders.splice(i, 1);
-      }
-    },
-
-    getFullReader: function PDFDataTransportStream_getFullReader() {
-      assert(!this._fullRequestReader);
-      var queuedChunks = this._queuedChunks;
-      this._queuedChunks = null;
-      return new PDFDataTransportStreamReader(this, queuedChunks);
-    },
-
-    getRangeReader: function PDFDataTransportStream_getRangeReader(begin, end) {
-      var reader = new PDFDataTransportStreamRangeReader(this, begin, end);
-      this._pdfDataRangeTransport.requestDataRange(begin, end);
-      this._rangeReaders.push(reader);
-      return reader;
-    },
-
-    cancelAllRequests:
-        function PDFDataTransportStream_cancelAllRequests(reason) {
-      if (this._fullRequestReader) {
-        this._fullRequestReader.cancel(reason);
-      }
-      var readers = this._rangeReaders.slice(0);
-      readers.forEach(function (rangeReader) {
-        rangeReader.cancel(reason);
-      });
-      this._pdfDataRangeTransport.abort();
-    },
-  };
-
-  /** @implements {IPDFStreamReader} */
-  function PDFDataTransportStreamReader(stream, queuedChunks) {
-    this._stream = stream;
-    this._done = false;
-    this._filename = null;
-    this._queuedChunks = queuedChunks || [];
-    this._requests = [];
-    this._headersReady = Promise.resolve();
-    stream._fullRequestReader = this;
-
-    this.onProgress = null; // not used
-  }
-  PDFDataTransportStreamReader.prototype = {
-    _enqueue: function PDFDataTransportStreamReader_enqueue(chunk) {
-      if (this._done) {
-        return; // ignore new data
-      }
-      if (this._requests.length > 0) {
-        var requestCapability = this._requests.shift();
-        requestCapability.resolve({ value: chunk, done: false, });
-        return;
-      }
-      this._queuedChunks.push(chunk);
-    },
-
-    get headersReady() {
-      return this._headersReady;
-    },
-
-    get filename() {
-      return this._filename;
-    },
-
-    get isRangeSupported() {
-      return this._stream._isRangeSupported;
-    },
-
-    get isStreamingSupported() {
-      return this._stream._isStreamingSupported;
-    },
-
-    get contentLength() {
-      return this._stream._contentLength;
-    },
-
-    async read() {
-      if (this._queuedChunks.length > 0) {
-        var chunk = this._queuedChunks.shift();
-        return { value: chunk, done: false, };
-      }
-      if (this._done) {
-        return { value: undefined, done: true, };
-      }
-      var requestCapability = createPromiseCapability();
-      this._requests.push(requestCapability);
-      return requestCapability.promise;
-    },
-
-    cancel: function PDFDataTransportStreamReader_cancel(reason) {
-      this._done = true;
-      this._requests.forEach(function (requestCapability) {
-        requestCapability.resolve({ value: undefined, done: true, });
-      });
-      this._requests = [];
-    },
-  };
-
-  /** @implements {IPDFStreamRangeReader} */
-  function PDFDataTransportStreamRangeReader(stream, begin, end) {
-    this._stream = stream;
-    this._begin = begin;
-    this._end = end;
-    this._queuedChunk = null;
-    this._requests = [];
-    this._done = false;
-
-    this.onProgress = null;
-  }
-  PDFDataTransportStreamRangeReader.prototype = {
-    _enqueue: function PDFDataTransportStreamRangeReader_enqueue(chunk) {
-      if (this._done) {
-        return; // ignore new data
-      }
-      if (this._requests.length === 0) {
-        this._queuedChunk = chunk;
+    if (begin === undefined) {
+      if (this._fullReader) {
+        this._fullReader._enqueue(buffer);
       } else {
-        var requestsCapability = this._requests.shift();
-        requestsCapability.resolve({ value: chunk, done: false, });
-        this._requests.forEach(function (requestCapability) {
-          requestCapability.resolve({ value: undefined, done: true, });
-        });
-        this._requests = [];
+        this._queuedChunks.push(buffer);
       }
-      this._done = true;
-      this._stream._removeRangeReader(this);
-    },
+    } else {
+      const rangeReader = this._rangeReaders
+        .keys()
+        .find(r => r._begin === begin);
 
-    get isStreamingSupported() {
-      return false;
-    },
+      assert(
+        rangeReader,
+        "#onReceiveData - no `PDFDataTransportStreamRangeReader` instance found."
+      );
+      rangeReader._enqueue(buffer);
+    }
+  }
 
-    async read() {
-      if (this._queuedChunk) {
-        let chunk = this._queuedChunk;
-        this._queuedChunk = null;
-        return { value: chunk, done: false, };
+  getFullReader() {
+    const reader = super.getFullReader();
+    this._queuedChunks = null;
+    return reader;
+  }
+
+  getRangeReader(begin, end) {
+    const reader = super.getRangeReader(begin, end);
+
+    if (reader) {
+      reader.onDone = () => this._rangeReaders.delete(reader);
+
+      this._source.pdfDataRangeTransport.requestDataRange(begin, end);
+    }
+    return reader;
+  }
+
+  cancelAllRequests(reason) {
+    super.cancelAllRequests(reason);
+
+    this._source.pdfDataRangeTransport.abort();
+  }
+}
+
+class PDFDataTransportStreamReader extends BasePDFStreamReader {
+  #endRequests = endRequests.bind(this);
+
+  _done = false;
+
+  _queuedChunks = null;
+
+  _requests = [];
+
+  constructor(stream) {
+    super(stream);
+    const { pdfDataRangeTransport, disableRange, disableStream } =
+      stream._source;
+    const { length, contentDispositionFilename } = pdfDataRangeTransport;
+
+    this._queuedChunks = stream._queuedChunks || [];
+    for (const chunk of this._queuedChunks) {
+      this._loaded += chunk.byteLength;
+    }
+    this._done = stream._progressiveDone;
+
+    this._contentLength = length;
+    this._isStreamingSupported = !disableStream;
+    this._isRangeSupported = !disableRange;
+
+    if (isPdfFile(contentDispositionFilename)) {
+      this._filename = contentDispositionFilename;
+    }
+    this._headersCapability.resolve();
+
+    // Report loading progress when there is `initialData`, and `_enqueue` has
+    // not been invoked, but with a small delay to give an `onProgress` callback
+    // a chance to be registered first.
+    const loaded = this._loaded;
+    Promise.resolve().then(() => {
+      if (loaded > 0 && this._loaded === loaded) {
+        this._callOnProgress();
       }
-      if (this._done) {
-        return { value: undefined, done: true, };
-      }
-      var requestCapability = createPromiseCapability();
-      this._requests.push(requestCapability);
-      return requestCapability.promise;
-    },
+    });
+  }
 
-    cancel: function PDFDataTransportStreamRangeReader_cancel(reason) {
-      this._done = true;
-      this._requests.forEach(function (requestCapability) {
-        requestCapability.resolve({ value: undefined, done: true, });
-      });
-      this._requests = [];
-      this._stream._removeRangeReader(this);
-    },
-  };
+  _enqueue(chunk) {
+    if (this._done) {
+      return; // Ignore new data.
+    }
+    if (this._requests.length > 0) {
+      const capability = this._requests.shift();
+      capability.resolve({ value: chunk, done: false });
+    } else {
+      this._queuedChunks.push(chunk);
+    }
+    this._loaded += chunk.byteLength;
+    this._callOnProgress();
+  }
 
-  return PDFDataTransportStream;
-})();
+  async read() {
+    if (this._queuedChunks.length > 0) {
+      const chunk = this._queuedChunks.shift();
+      return { value: chunk, done: false };
+    }
+    if (this._done) {
+      return { value: undefined, done: true };
+    }
+    const capability = Promise.withResolvers();
+    this._requests.push(capability);
+    return capability.promise;
+  }
 
-export {
-  PDFDataTransportStream,
-};
+  cancel(reason) {
+    this._done = true;
+    this.#endRequests();
+  }
+
+  progressiveDone() {
+    this._done ||= true;
+
+    if (this._queuedChunks.length === 0) {
+      this.#endRequests();
+    }
+  }
+}
+
+class PDFDataTransportStreamRangeReader extends BasePDFStreamRangeReader {
+  #endRequests = endRequests.bind(this);
+
+  onDone = null;
+
+  _begin = -1;
+
+  _done = false;
+
+  _queuedChunk = null;
+
+  _requests = [];
+
+  constructor(stream, begin, end) {
+    super(stream, begin, end);
+    this._begin = begin;
+  }
+
+  _enqueue(chunk) {
+    if (this._done) {
+      return; // ignore new data
+    }
+    if (this._requests.length === 0) {
+      this._queuedChunk = chunk;
+    } else {
+      const capability = this._requests.shift();
+      capability.resolve({ value: chunk, done: false });
+
+      this.#endRequests();
+    }
+    this._done = true;
+    this.onDone?.();
+  }
+
+  async read() {
+    if (this._queuedChunk) {
+      const chunk = this._queuedChunk;
+      this._queuedChunk = null;
+      return { value: chunk, done: false };
+    }
+    if (this._done) {
+      return { value: undefined, done: true };
+    }
+    const capability = Promise.withResolvers();
+    this._requests.push(capability);
+    return capability.promise;
+  }
+
+  cancel(reason) {
+    this._done = true;
+    this.#endRequests();
+    this.onDone?.();
+  }
+}
+
+export { endRequests, PDFDataTransportStream };

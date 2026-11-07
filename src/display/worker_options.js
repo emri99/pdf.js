@@ -13,27 +13,101 @@
  * limitations under the License.
  */
 
-const GlobalWorkerOptions = Object.create(null);
+class GlobalWorkerOptions {
+  static #port = null;
 
-/**
- * Defines global port for worker process. Overrides the `workerSrc` option.
- * @var {Object}
- */
-GlobalWorkerOptions.workerPort = (GlobalWorkerOptions.workerPort === undefined ?
-                                  null : GlobalWorkerOptions.workerPort);
+  static #rendererPorts = [];
 
-/**
- * Path and filename of the worker file. Required when workers are enabled in
- * development mode. If unspecified in production builds, the worker will be
- * loaded based on the location of the `pdf.js` file.
- *
- * NOTE: The `workerSrc` should always be set in custom applications, in order
- *       to prevent issues caused by third-party frameworks and libraries.
- * @var {string}
- */
-GlobalWorkerOptions.workerSrc = (GlobalWorkerOptions.workerSrc === undefined ?
-                                 '' : GlobalWorkerOptions.workerSrc);
+  static #rendererSrc = "";
 
-export {
-  GlobalWorkerOptions,
-};
+  static #src = "";
+
+  /**
+   * @type {Array<Worker>}
+   */
+  static get rendererPorts() {
+    return this.#rendererPorts;
+  }
+
+  /**
+   * @param {Array<Worker>} val - Caller-owned workers, one document per worker.
+   *   Uses `rendererSrc` when no supplied worker is available.
+   */
+  static set rendererPorts(val) {
+    if (
+      !Array.isArray(val) ||
+      !val.every(
+        port => typeof Worker !== "undefined" && port instanceof Worker
+      )
+    ) {
+      throw new Error("Invalid `rendererPorts` type.");
+    }
+    this.#rendererPorts = val;
+  }
+
+  /**
+   * @type {string}
+   */
+  static get rendererSrc() {
+    return this.#rendererSrc;
+  }
+
+  /**
+   * @param {string} val - A string containing the path and
+   *   filename of the renderer worker file.
+   *
+   *   NOTE: The `rendererSrc` option must be set in order to render pages in a
+   *         worker thread, unless `rendererPorts` contains an unused worker;
+   *         otherwise, rendering falls back to the main-thread.
+   */
+  static set rendererSrc(val) {
+    if (typeof val !== "string") {
+      throw new Error("Invalid `rendererSrc` type.");
+    }
+    this.#rendererSrc = val;
+  }
+
+  /**
+   * @type {Worker | null}
+   */
+  static get workerPort() {
+    return this.#port;
+  }
+
+  /**
+   * @param {Worker | null} val - Defines global port for worker process.
+   *   Overrides the `workerSrc` option.
+   */
+  static set workerPort(val) {
+    if (
+      !(typeof Worker !== "undefined" && val instanceof Worker) &&
+      val !== null
+    ) {
+      throw new Error("Invalid `workerPort` type.");
+    }
+    this.#port = val;
+  }
+
+  /**
+   * @type {string}
+   */
+  static get workerSrc() {
+    return this.#src;
+  }
+
+  /**
+   * @param {string} val - A string containing the path and filename of
+   *   the worker file.
+   *
+   *   NOTE: The `workerSrc` option should always be set, in order to prevent
+   *         any issues when using the PDF.js library.
+   */
+  static set workerSrc(val) {
+    if (typeof val !== "string") {
+      throw new Error("Invalid `workerSrc` type.");
+    }
+    this.#src = val;
+  }
+}
+
+export { GlobalWorkerOptions };

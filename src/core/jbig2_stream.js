@@ -13,70 +13,92 @@
  * limitations under the License.
  */
 
-import { isDict, isStream } from './primitives';
-import { DecodeStream } from './stream';
-import { Jbig2Image } from './jbig2';
-import { shadow } from '../shared/util';
+import { BaseStream } from "./base_stream.js";
+import { DecodeStream } from "./decode_stream.js";
+import { Dict } from "./primitives.js";
+import { JBig2CCITTFaxImage } from "./jbig2_ccittFax.js";
+import { shadow } from "../shared/util.js";
 
 /**
  * For JBIG2's we use a library to decode these images and
  * the stream behaves like all the other DecodeStreams.
  */
-let Jbig2Stream = (function Jbig2StreamClosure() {
-  function Jbig2Stream(stream, maybeLength, dict, params) {
-    this.stream = stream;
-    this.maybeLength = maybeLength;
-    this.dict = dict;
-    this.params = params;
+class Jbig2Stream extends DecodeStream {
+  constructor(stream, maybeLength, params) {
+    super(maybeLength);
 
-    DecodeStream.call(this, maybeLength);
+    this.stream = stream;
+    this.dict = stream.dict;
+    this.maybeLength = maybeLength;
+    this.params = params;
   }
 
-  Jbig2Stream.prototype = Object.create(DecodeStream.prototype);
+  get bytes() {
+    // If `this.maybeLength` is null, we'll get the entire stream.
+    return shadow(this, "bytes", this.stream.getBytes(this.maybeLength));
+  }
 
-  Object.defineProperty(Jbig2Stream.prototype, 'bytes', {
-    get() {
-      // If `this.maybeLength` is null, we'll get the entire stream.
-      return shadow(this, 'bytes', this.stream.getBytes(this.maybeLength));
-    },
-    configurable: true,
-  });
-
-  Jbig2Stream.prototype.ensureBuffer = function(requested) {
+  ensureBuffer(requested) {
     // No-op, since `this.readBlock` will always parse the entire image and
     // directly insert all of its data into `this.buffer`.
-  };
+  }
 
-  Jbig2Stream.prototype.readBlock = function() {
-    if (this.eof) {
-      return;
+  get isAsyncDecoder() {
+    return true;
+  }
+
+  get isImageStream() {
+    return true;
+  }
+
+  // The JBIG2 file header is defined in ITU-T T.88, Annex D.4:
+  // https://www.itu.int/rec/T-REC-T.88
+  static stripFileHeader(bytes) {
+    if (
+      bytes.length >= 9 &&
+      bytes[0] === 0x97 &&
+      bytes[1] === 0x4a &&
+      bytes[2] === 0x42 &&
+      bytes[3] === 0x32 &&
+      bytes[4] === 0x0d &&
+      bytes[5] === 0x0a &&
+      bytes[6] === 0x1a &&
+      bytes[7] === 0x0a
+    ) {
+      const headerLength = (bytes[8] & 2) === 0 ? 13 : 9;
+      return bytes.subarray(headerLength);
     }
-    let jbig2Image = new Jbig2Image();
+    return bytes;
+  }
 
-    let chunks = [];
-    if (isDict(this.params)) {
-      let globalsStream = this.params.get('JBIG2Globals');
-      if (isStream(globalsStream)) {
-        let globals = globalsStream.getBytes();
-        chunks.push({ data: globals, start: 0, end: globals.length, });
+  async decodeImage(bytes, length, _decoderOptions) {
+    if (this.eof) {
+      return this.buffer;
+    }
+    bytes = Jbig2Stream.stripFileHeader(bytes || this.bytes);
+
+    let globals = null;
+    if (this.params instanceof Dict) {
+      const globalsStream = this.params.get("JBIG2Globals");
+      if (globalsStream instanceof BaseStream) {
+        globals = Jbig2Stream.stripFileHeader(globalsStream.getBytes());
       }
     }
-    chunks.push({ data: this.bytes, start: 0, end: this.bytes.length, });
-    let data = jbig2Image.parseChunks(chunks);
-    let dataLength = data.length;
-
-    // JBIG2 had black as 1 and white as 0, inverting the colors
-    for (let i = 0; i < dataLength; i++) {
-      data[i] ^= 0xFF;
-    }
-    this.buffer = data;
-    this.bufferLength = dataLength;
+    this.buffer = await JBig2CCITTFaxImage.instance.decode(
+      bytes,
+      this.dict.get("Width"),
+      this.dict.get("Height"),
+      globals
+    );
+    this.bufferLength = this.buffer.length;
     this.eof = true;
-  };
 
-  return Jbig2Stream;
-})();
+    return this.buffer;
+  }
 
-export {
-  Jbig2Stream,
-};
+  get canAsyncDecodeImageFromBuffer() {
+    return this.stream.isAsync;
+  }
+}
+
+export { Jbig2Stream };

@@ -13,101 +13,125 @@
  * limitations under the License.
  */
 
-import {
-  createObjectURL, createPromiseCapability, getFilenameFromUrl,
-  removeNullCharacters
-} from 'pdfjs-lib';
+/** @typedef {import("./event_utils.js").EventBus} EventBus */
+// eslint-disable-next-line max-len
+/** @typedef {import("./download_manager.js").DownloadManager} DownloadManager */
 
 /**
- * @typedef {Object} PDFAttachmentViewerOptions
+ * @import {
+ *   CatalogAttachmentContent,
+ *   CatalogAttachment,
+ * } from "../src/core/catalog.js";
+ * @import { PDFLinkService } from "./pdf_link_service.js";
+ */
+
+import { BaseTreeViewer } from "./base_tree_viewer.js";
+import { internalOpt } from "./internal_evt.js";
+import { waitOnEventOrTimeout } from "./event_utils.js";
+
+/**
+ * @typedef {object} PDFAttachmentViewerOptions
  * @property {HTMLDivElement} container - The viewer element.
  * @property {EventBus} eventBus - The application event bus.
  * @property {DownloadManager} downloadManager - The download manager.
+ * @property {PDFLinkService} linkService - Link service.
  */
 
 /**
- * @typedef {Object} PDFAttachmentViewerRenderParameters
- * @property {Object|null} attachments - A lookup table of attachment objects.
+ * @typedef PDFAttachmentViewerRenderParameters
+ * @property {Map<string, CatalogAttachment> | null} attachments - A lookup
+ *   table of attachment objects.
+ * @property {boolean} [keepRenderedCapability]
  */
 
-class PDFAttachmentViewer {
+class PDFAttachmentViewer extends BaseTreeViewer {
   /**
    * @param {PDFAttachmentViewerOptions} options
    */
-  constructor({ container, eventBus, downloadManager, }) {
-    this.container = container;
-    this.eventBus = eventBus;
-    this.downloadManager = downloadManager;
+  constructor(options) {
+    super(options);
+    this.downloadManager = options.downloadManager;
+    this.linkService = options.linkService;
 
-    this.reset();
-
-    this.eventBus.on('fileattachmentannotation',
-      this._appendAttachment.bind(this));
+    this.eventBus.on(
+      "fileattachmentannotation",
+      this.#appendAttachment.bind(this),
+      internalOpt
+    );
   }
 
   reset(keepRenderedCapability = false) {
-    this.attachments = null;
-
-    // Remove the attachments from the DOM.
-    this.container.textContent = '';
+    super.reset();
+    this._attachments = null;
 
     if (!keepRenderedCapability) {
-      // NOTE: The *only* situation in which the `_renderedCapability` should
-      //       not be replaced is when appending file attachment annotations.
-      this._renderedCapability = createPromiseCapability();
+      // The only situation in which the `_renderedCapability` should *not* be
+      // replaced is when appending FileAttachment annotations.
+      this._renderedCapability = Promise.withResolvers();
     }
+    this._pendingDispatchEvent = false;
   }
 
   /**
-   * @private
+   * @protected
    */
-  _dispatchEvent(attachmentsCount) {
+  async _dispatchEvent(attachmentsCount) {
     this._renderedCapability.resolve();
 
-    this.eventBus.dispatch('attachmentsloaded', {
+    if (attachmentsCount === 0 && !this._pendingDispatchEvent) {
+      // Delay the event when no "regular" attachments exist, to allow time for
+      // parsing of any FileAttachment annotations that may be present on the
+      // *initially* rendered page; this reduces the likelihood of temporarily
+      // disabling the attachmentsView when the `PDFSidebar` handles the event.
+      this._pendingDispatchEvent = true;
+
+      await waitOnEventOrTimeout({
+        target: this.eventBus,
+        name: "annotationlayerrendered",
+        delay: 1000,
+      });
+
+      if (!this._pendingDispatchEvent) {
+        return; // There was already another `_dispatchEvent`-call`.
+      }
+    }
+    this._pendingDispatchEvent = false;
+
+    this.eventBus.dispatch("attachmentsloaded", {
       source: this,
       attachmentsCount,
     });
   }
 
   /**
-   * @private
+   * @param {HTMLAnchorElement} element
+   * @param {CatalogAttachment & { attachmentId?: string }} item
+   * @returns {undefined}
+   * @protected
    */
-  _bindPdfLink(button, content, filename) {
-    if (this.downloadManager.disableCreateObjectURL) {
-      throw new Error(
-        'bindPdfLink: Unsupported "disableCreateObjectURL" value.');
+  _bindLink(
+    element,
+    { attachmentId, content: fallbackContent, description, filename }
+  ) {
+    if (description) {
+      element.title = description;
     }
-    let blobUrl;
-    button.onclick = function() {
-      if (!blobUrl) {
-        blobUrl = createObjectURL(content, 'application/pdf');
-      }
-      let viewerUrl;
-      if (typeof PDFJSDev === 'undefined' || PDFJSDev.test('GENERIC')) {
-        // The current URL is the viewer, let's use it and append the file.
-        viewerUrl = '?file=' + encodeURIComponent(blobUrl + '#' + filename);
-      } else if (PDFJSDev.test('CHROME')) {
-        // In the Chrome extension, the URL is rewritten using the history API
-        // in viewer.js, so an absolute URL must be generated.
-        // eslint-disable-next-line no-undef
-        viewerUrl = chrome.runtime.getURL('/content/web/viewer.html') +
-          '?file=' + encodeURIComponent(blobUrl + '#' + filename);
-      } else if (PDFJSDev.test('FIREFOX || MOZCENTRAL')) {
-        // Let Firefox's content handler catch the URL and display the PDF.
-        viewerUrl = blobUrl + '?' + encodeURIComponent(filename);
-      }
-      window.open(viewerUrl);
-      return false;
-    };
-  }
 
-  /**
-   * @private
-   */
-  _bindLink(button, content, filename) {
-    button.onclick = () => {
-      this.downloadManager.downloadData(content, filename, '');
+    const openAttachment = async () => {
+      /** @type {CatalogAttachmentContent | undefined} */
+      // Prefer lazy loading when we have an attachment id; fallbackContent is
+      // only for the annotation-append path where bytes may already be present.
+      const content = attachmentId
+        ? await this.linkService.getAttachmentContent(attachmentId)
+        : fallbackContent;
+
+      if (content) {
+        this.downloadManager?.openOrDownloadData(content, filename);
+      }
+    };
+
+    element.onclick = () => {
+      openAttachment();
       return false;
     };
   }
@@ -115,67 +139,55 @@ class PDFAttachmentViewer {
   /**
    * @param {PDFAttachmentViewerRenderParameters} params
    */
-  render({ attachments, keepRenderedCapability = false, }) {
-    let attachmentsCount = 0;
-
-    if (this.attachments) {
-      this.reset(keepRenderedCapability === true);
+  render({ attachments, keepRenderedCapability = false }) {
+    if (this._attachments) {
+      this.reset(keepRenderedCapability);
     }
-    this.attachments = attachments || null;
+    this._attachments = attachments || null;
 
     if (!attachments) {
-      this._dispatchEvent(attachmentsCount);
+      this._dispatchEvent(/* attachmentsCount = */ 0);
       return;
     }
 
-    let names = Object.keys(attachments).sort(function(a, b) {
-      return a.toLowerCase().localeCompare(b.toLowerCase());
-    });
-    attachmentsCount = names.length;
+    const fragment = document.createDocumentFragment();
+    const ul = document.createElement("ul");
+    fragment.append(ul);
+    let attachmentsCount = 0;
+    for (const [name, item] of attachments) {
+      const li = document.createElement("li");
+      ul.append(li);
+      const element = document.createElement("a");
+      li.append(element);
+      this._bindLink(element, {
+        ...item,
+        attachmentId: item.attachmentId ?? name,
+      });
+      element.textContent = this._normalizeTextContent(item.filename);
 
-    for (let i = 0; i < attachmentsCount; i++) {
-      let item = attachments[names[i]];
-      let filename = removeNullCharacters(getFilenameFromUrl(item.filename));
-
-      let div = document.createElement('div');
-      div.className = 'attachmentsItem';
-      let button = document.createElement('button');
-      button.textContent = filename;
-      if (/\.pdf$/i.test(filename) &&
-          !this.downloadManager.disableCreateObjectURL) {
-        this._bindPdfLink(button, item.content, filename);
-      } else {
-        this._bindLink(button, item.content, filename);
-      }
-
-      div.appendChild(button);
-      this.container.appendChild(div);
+      attachmentsCount++;
     }
 
-    this._dispatchEvent(attachmentsCount);
+    this._finishRendering(fragment, attachmentsCount);
   }
 
   /**
    * Used to append FileAttachment annotations to the sidebar.
-   * @private
    */
-  _appendAttachment({ id, filename, content, }) {
-    this._renderedCapability.promise.then(() => {
-      let attachments = this.attachments;
+  #appendAttachment(item) {
+    const renderedPromise = this._renderedCapability.promise;
 
-      if (!attachments) {
-        attachments = Object.create(null);
-      } else {
-        for (let name in attachments) {
-          if (id === name) {
-            return; // Ignore the new attachment if it already exists.
-          }
-        }
+    renderedPromise.then(() => {
+      if (renderedPromise !== this._renderedCapability.promise) {
+        return; // The FileAttachment annotation belongs to a previous document.
       }
-      attachments[id] = {
-        filename,
-        content,
-      };
+      const attachments = new Map(this._attachments);
+
+      if (attachments.has(item.filename)) {
+        return; // Ignore the new attachment if it already exists.
+      }
+      attachments.set(item.filename, item);
+
       this.render({
         attachments,
         keepRenderedCapability: true,
@@ -184,6 +196,4 @@ class PDFAttachmentViewer {
   }
 }
 
-export {
-  PDFAttachmentViewer,
-};
+export { PDFAttachmentViewer };
